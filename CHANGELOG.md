@@ -14,13 +14,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Roles per room membership, `@role` addressing, and `role set`; no-role joins default to `guest`.
 - Session lifecycle: `join`, `leave` (per room), `leave --all`, and a `prune` janitor for stale sessions.
 - Request/grant/deny flow for secrets, with consume-once delivery (secrets hard-deleted after one `recv`, masked in `inbox` peeks).
-- Optional Claude Code hooks: `UserPromptSubmit` push delivery and `SessionEnd` auto-unregister.
+- Identity model: users (`userId` + `username`) that own many sessions (one per terminal/agent); `.lorewire.jsonc` project config (JSONC) supplying identity/room/role, with walk-up discovery and env/flag overrides.
+- Agent-agnostic, stable session ids: derived from an agent's per-session env var (`LOREWIRE_SESSION_TOKEN` / `LOREWIRE_SESSION_ENV` / a built-in known-list) with tty/pid fallbacks; `id_source` records the layer used.
+- Rich per-session context columns (cwd, tty, pid, host, client, os_user, os, arch, shell, term_program, ssh, tmux, git branch/repo, version).
+- Commands: `whoami` (full session detail + JSON), `import` (re-create a config's identity on a fresh machine), `reset` (sessions/messages/all, with `--user`/`--me` and a confirm gate), `--me` filters on `sessions`/`rooms`, `user rename` (cascades to session ids), `user sessions` (live + historical), and `log` (message-history transcript).
+- Identity-level message history: messages record `from_owner`/`to_owner` (userIds); `inbox` is user-scoped (with `--session`), `log` keys on userId so history spans a user's past sessions.
+- Optional Claude Code hooks: `SessionStart` register, `UserPromptSubmit` push delivery, `SessionEnd` auto-unregister.
 
 ### Changed
+- `inbox` is now user-scoped (all your sessions) instead of single-session; `recv` remains the session-scoped consuming read.
+
 ### Deprecated
 ### Removed
 ### Fixed
+- Migration ordering: owner-column indexes are created after the columns are added, so upgrading an existing database no longer fails.
+
 ### Security
+- SQLite `synchronous=NORMAL` under WAL; consume-once secrets; masked secret bodies in non-consuming peeks.
 
 <!--
 Release process:

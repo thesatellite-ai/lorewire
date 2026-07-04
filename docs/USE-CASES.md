@@ -18,6 +18,7 @@ Session-id suffixes (the `~a1b2` part) vary per terminal/agent — yours will di
 - [9. A CI bot that pings a maintainer](#9-a-ci-bot-that-pings-a-maintainer)
 - [10. Move to a new machine (import)](#10-move-to-a-new-machine-import)
 - [11. Inspect & clean up](#11-inspect--clean-up)
+- [12. Read message history](#12-read-message-history)
 - [Mapping to AI agents](#mapping-to-ai-agents)
 
 ## Setup (once)
@@ -343,6 +344,46 @@ lorewire reset sessions --user bob # preview removing just bob's sessions
 lorewire reset sessions --user bob --yes
 lorewire reset all --yes           # wipe everything (then re-`import` identities)
 ```
+
+## 12. Read message history
+
+**Goal:** see past messages — `recv` consumes (once), so use these to read history.
+
+**Your own mail (across all your terminals), without consuming:**
+
+```bash
+cd ~/team/bob
+lorewire inbox --all                 # every message to me (any of my sessions), read + unread
+lorewire inbox --session bob~a1f2    # narrow to one of my sessions
+```
+
+**A room's full transcript (everyone):**
+
+```bash
+lorewire log --room project-x
+#   transcript — room "project-x" (14 message(s)):
+#   [14:02:11] project-x/alice~… → bob~…: please take the login page
+#   [14:10:03] project-x/bob~…   → alice~…: I'll take it
+#   …
+```
+
+**Everything a user ever sent or received (keyed on identity — spans their old sessions):**
+
+```bash
+lorewire log --user bob              # all of bob's history, any room, any past session
+lorewire log --user bob --limit 20   # last 20
+```
+
+**Which sessions a user has had (live + gone):**
+
+```bash
+lorewire user sessions bob
+#   bob (usr_…)
+#     live (1): bob~4b619fd6  …
+#     historical (3, from message history — no longer live): bob~0078, bob~4b61, bob~c491
+```
+
+**What happened:** `inbox`/`log`/`user sessions` are all read-only and key on the **user** (userId), not a single session — so history survives even after sessions leave or the session-id changes. (`recv` stays session-scoped and consuming — it's for *getting new mail*, not browsing history. Consumed secrets are gone by design.)
 
 ## Mapping to AI agents
 

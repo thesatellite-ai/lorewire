@@ -210,6 +210,7 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 |---|---|
 | `lorewire user create NAME [--id usr_…] [--room R] [--role X]` | Claim a username (mint or `--id`-import a userId); writes `./.lorewire.jsonc`. |
 | `lorewire user list [--json]` | List users and their session counts. |
+| `lorewire user sessions NAME [--json]` | All of a user's sessions — **live + historical** (past sessions surviving in message history). |
 | `lorewire user rename OLD NEW` | Rename a username (userId unchanged; cascades to live session handles). |
 | `lorewire init --username NAME \| --user usr_…` | Point this dir's `.lorewire.jsonc` at an existing identity. |
 | `lorewire import [NAME]` | Re-create this dir's `.lorewire.jsonc` identity in the DB (fresh machine / after a wipe). Idempotent. |
@@ -236,8 +237,9 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 | Command | What it does |
 |---|---|
 | `lorewire send [--room ROOM] --to NAME\|@ROLE\|all\|SESSION MSG` | Send. `NAME` fans out to all that user's sessions in the room; `@ROLE` to everyone with that role; `all` to all members; `SESSION` (`bob~a1f`) to one terminal. `MSG` positional or `--msg`. |
-| `lorewire recv [--room ROOM] [--json]` | Read **and consume** unread messages. Without `--room`, drains **all** your rooms at once. |
-| `lorewire inbox [--room ROOM] [--all] [--json]` | Show messages without consuming. Secret bodies are masked here. |
+| `lorewire recv [--room ROOM] [--json]` | Read **and consume** unread messages for **this session**. Without `--room`, drains all your rooms. |
+| `lorewire inbox [--room ROOM] [--session ID] [--all] [--json]` | Your **user's** mail across all your sessions, without consuming (`--session` narrows to one; `--all` includes read). Secrets masked. |
+| `lorewire log [--room ROOM\|all] [--user NAME] [--limit N] [--json]` | Read-only **history transcript** — by room and/or user (keyed on userId, so it spans a user's past sessions). |
 | `lorewire watch [--room ROOM] [--interval 2s] [--json]` | Block and stream new messages as they arrive. |
 
 **Requesting secrets** (ask whoever holds a role for something they have)

@@ -56,6 +56,8 @@ func main() {
 		err = cmdRole(args)
 	case "sessions":
 		err = cmdSessions(args)
+	case "log":
+		err = cmdLog(args)
 	case "send":
 		err = cmdSend(args)
 	case "request":
@@ -124,7 +126,9 @@ COMMANDS  (🌐 GLOBAL = works from ANY directory · 📁 SESSION = acts as you,
 
   🌐 GLOBAL — inspect/manage everything, from any directory:
     lorewire sessions [--me] [--json]          list live sessions (all, or --me = just yours)
+    lorewire log [--room R|all] [--user NAME] [--limit N]   read message history (transcript; no consuming)
     lorewire user list [--json]                list all users + session counts
+    lorewire user sessions NAME                all of a user's sessions — live + historical
     lorewire user rename OLD NEW               rename a username (userId unchanged)
     lorewire rooms [--me] [--json]             list rooms (all, or --me = only ones you're in)
     lorewire members [--room ROOM] [--json]    list a room's members and roles
@@ -141,7 +145,7 @@ COMMANDS  (🌐 GLOBAL = works from ANY directory · 📁 SESSION = acts as you,
     lorewire leave --all [--purge]              remove this terminal's session from every room
     lorewire send [--room ROOM] --to NAME|@ROLE|all|SESSION MSG   send a message
     lorewire recv  [--room ROOM] [--json]       read + consume unread messages
-    lorewire inbox [--room ROOM] [--all] [--json]   show messages without consuming
+    lorewire inbox [--room ROOM] [--session ID] [--all] [--json]   your user's mail (all your sessions), no consuming
     lorewire watch [--room ROOM] [--interval 2s]    stream new messages
     lorewire request [--room ROOM] --to @ROLE|NAME MSG   ask a role-holder for something (e.g. a key)
     lorewire grant ID --secret VALUE            answer a request with a consume-once secret
@@ -380,9 +384,55 @@ func cmdUser(args []string) error {
 		return cmdUserList(args[1:])
 	case "rename":
 		return cmdUserRename(args[1:])
+	case "sessions":
+		return cmdUserSessions(args[1:])
 	default:
-		return fmt.Errorf("unknown user subcommand %q (create|list|rename)", args[0])
+		return fmt.Errorf("unknown user subcommand %q (create|list|rename|sessions)", args[0])
 	}
+}
+
+// cmdUserSessions lists all sessions a user has ever had — live now, plus
+// historical ones that only survive in message history (left/pruned sessions
+// that sent or received messages). Identity outlives any single session.
+func cmdUserSessions(args []string) error {
+	fs := flag.NewFlagSet("user sessions", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		return fmt.Errorf("usage: lorewire user sessions NAME")
+	}
+	name := fs.Arg(0)
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	uid, ok, err := st.UserByName(name)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("no user named %q", name)
+	}
+	live, historical, err := st.UserSessions(uid)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(map[string]any{"username": name, "userId": uid, "live": live, "historical": historical})
+	}
+	fmt.Printf("%s (%s)\n", name, uid)
+	fmt.Printf("  live (%d):\n", len(live))
+	for _, se := range live {
+		fmt.Printf("    %-18s  %s  %s  seen %s\n", se.ID, orDash(se.CWD), orDash(se.Client), humanAgo(se.LastSeen))
+	}
+	if len(historical) > 0 {
+		fmt.Printf("  historical (%d, from message history — no longer live):\n", len(historical))
+		for _, sid := range historical {
+			fmt.Printf("    %s\n", sid)
+		}
+	}
+	return nil
 }
 
 func cmdUserCreate(args []string) error {
@@ -1090,6 +1140,70 @@ func cmdSessions(args []string) error {
 	return nil
 }
 
+// cmdLog prints a read-only message transcript (no consuming). Unlike recv/inbox
+// it is not scoped to your current session, so it shows full history — including
+// messages addressed to session ids that no longer exist. Defaults to the
+// current room; `--user` spans all of a user's sessions across rooms.
+func cmdLog(args []string) error {
+	fs := flag.NewFlagSet("log", flag.ExitOnError)
+	room := fs.String("room", "", "room to show (default: this folder's room; use 'all' for every room)")
+	user := fs.String("user", "", "only messages involving this username (any of their sessions)")
+	limit := fs.Int("limit", 0, "show only the most recent N messages")
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.Parse(args)
+
+	// Room defaulting: with no --room and no --user, use the folder's room; with
+	// --user and no --room, span all rooms so nothing is missed.
+	r := *room
+	if r == "" && *user == "" {
+		r = resolveRoomFlag("")
+	}
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	// Resolve --user (a username, or a usr_ id) to the owning userId — the log
+	// keys on identity, not on session strings.
+	ownerID := ""
+	if *user != "" {
+		if strings.HasPrefix(*user, userIDPrefix) {
+			ownerID = *user
+		} else if uid, ok, err := st.UserByName(*user); err != nil {
+			return err
+		} else if !ok {
+			return fmt.Errorf("no user named %q", *user)
+		} else {
+			ownerID = uid
+		}
+	}
+	msgs, err := st.MessagesLog(r, ownerID, *limit)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(msgs)
+	}
+	if len(msgs) == 0 {
+		fmt.Println("(no messages)")
+		return nil
+	}
+	// Header describing the scope.
+	scope := "all rooms"
+	if r != "" && r != addrAll {
+		scope = "room " + strconv.Quote(r)
+	}
+	if *user != "" {
+		scope += ", involving " + strconv.Quote(*user)
+	}
+	fmt.Printf("transcript — %s (%d message(s)):\n", scope, len(msgs))
+	for _, m := range msgs {
+		fmt.Println(formatMessage(m))
+	}
+	return nil
+}
+
 // ── Messaging ───────────────────────────────────────────────────────────────
 
 func cmdSend(args []string) error {
@@ -1119,12 +1233,21 @@ func cmdSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	recipients, err := st.Send(id.room, id.sessionID, *to, body, msgKind, nil)
+	recipients, err := st.Send(id.room, id.sessionID, id.userID, *to, body, msgKind, nil)
 	if err != nil {
 		return err
 	}
-	warnOrReport(recipients, id.room, *to)
+	warnOrReport(recipientIDs(recipients), id.room, *to)
 	return nil
+}
+
+// recipientIDs flattens resolved recipients to their session ids for display.
+func recipientIDs(rs []recipient) []string {
+	out := make([]string, len(rs))
+	for i, r := range rs {
+		out[i] = r.ID
+	}
+	return out
 }
 
 func cmdRequest(args []string) error {
@@ -1154,7 +1277,7 @@ func cmdRequest(args []string) error {
 	if err != nil {
 		return err
 	}
-	recipients, err := st.Send(id.room, id.sessionID, *to, body, requestKind, nil)
+	recipients, err := st.Send(id.room, id.sessionID, id.userID, *to, body, requestKind, nil)
 	if err != nil {
 		return err
 	}
@@ -1163,7 +1286,7 @@ func cmdRequest(args []string) error {
 		return nil
 	}
 	fmt.Printf("requested from %s in room %q — they answer with `lorewire grant ID --secret ...`\n",
-		strings.Join(recipients, ", "), id.room)
+		strings.Join(recipientIDs(recipients), ", "), id.room)
 	return nil
 }
 
@@ -1193,7 +1316,7 @@ func cmdGrant(args []string) error {
 	if err != nil {
 		return err
 	}
-	requester, room, err := st.Grant(reqID, id.sessionID, val)
+	requester, room, err := st.Grant(reqID, id.sessionID, id.userID, val)
 	if err != nil {
 		return err
 	}
@@ -1223,7 +1346,7 @@ func cmdDeny(args []string) error {
 	if err != nil {
 		return err
 	}
-	requester, room, err := st.Deny(reqID, id.sessionID, reason)
+	requester, room, err := st.Deny(reqID, id.sessionID, id.userID, reason)
 	if err != nil {
 		return err
 	}
@@ -1274,6 +1397,7 @@ func cmdInbox(args []string) error {
 	fUser := fs.String("user", "", "userId override")
 	fName := fs.String("name", "", "username override")
 	room := fs.String("room", "", "limit to one room (default: all your rooms)")
+	session := fs.String("session", "", "limit to one of your sessions (default: all your sessions)")
 	all := fs.Bool("all", false, "include already-read messages")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
@@ -1286,7 +1410,8 @@ func cmdInbox(args []string) error {
 	if err != nil {
 		return err
 	}
-	msgs, err := st.Inbox(id.sessionID, *room, *all)
+	// Inbox is USER-scoped (all of my sessions); --session narrows to one.
+	msgs, err := st.Inbox(id.userID, *session, *room, *all)
 	if err != nil {
 		return err
 	}

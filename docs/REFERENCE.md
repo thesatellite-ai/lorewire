@@ -188,6 +188,25 @@ Renames a username. The userId is unchanged (so committed configs keep working),
 lorewire user rename bob bobby
 ```
 
+#### `lorewire user sessions`
+
+```
+lorewire user sessions NAME [--json]
+```
+
+Lists all sessions a user has ever had — **live** now (full rows) plus **historical** ones that only survive in message history (sessions that left / were pruned but sent or received messages). Identity outlives any single session.
+
+```bash
+lorewire user sessions bob
+#   bob (usr_k3n9x2p)
+#     live (1):
+#       bob~4b619fd6   /Users/bob/project   shell   seen 2m ago
+#     historical (3, from message history — no longer live):
+#       bob~0078
+#       bob~4b61
+#       bob~c491
+```
+
 #### `lorewire init`
 
 ```
@@ -457,14 +476,33 @@ lorewire recv --room project-x --json
 #### `lorewire inbox`
 
 ```
-lorewire inbox [--room ROOM] [--all] [--name NAME] [--user usr_…] [--json]
+lorewire inbox [--room ROOM] [--session ID] [--all] [--name NAME] [--user usr_…] [--json]
 ```
 
-Shows messages **without** consuming them. `--all` includes already-read history. Secret bodies are masked here (only `recv` reveals them).
+Shows messages **without** consuming them. Unlike `recv` (which consumes your terminal's mail), `inbox` is **user-scoped** — it shows messages to **any of your sessions**, because a user owns many sessions. `--session ID` narrows to one of your sessions; `--room` scopes to a room; `--all` includes already-read history. Secret bodies are masked here (only `recv` reveals them).
 
 ```bash
-lorewire inbox --all
+lorewire inbox --all                 # all my mail, every session, read + unread
 lorewire inbox --room project-x
+lorewire inbox --session bob~a1f2    # just this one session's mail
+```
+
+#### `lorewire log`
+
+```
+lorewire log [--room ROOM|all] [--user NAME|usr_…] [--limit N] [--json]
+```
+
+Prints a read-only **message transcript** — full history, **without consuming**. Unlike `inbox` (your mail) this shows conversations regardless of recipient, keyed on **identity**: `--user` matches every message a user sent or received across all their sessions (by userId), so it surfaces history even for sessions that no longer exist.
+
+- No `--room`/`--user` → the current folder's room transcript. `--room all` → every room.
+- `--user NAME` (with no `--room`) → that user's full history across all rooms.
+- `--limit N` → the most recent N (shown oldest-first).
+
+```bash
+lorewire log --room project-x           # full room transcript
+lorewire log --user bob                  # everything bob ever sent/received
+lorewire log --user bob --room project-x --limit 50
 ```
 
 #### `lorewire watch`
@@ -555,7 +593,9 @@ sessions(session_id PK, owner_id, cwd, tty, pid, host, client,
          os_user, os, arch, shell, term_program, ssh, tmux, git_branch, git_repo, version, id_source,
          meta, created_at, last_seen)
 members(room, session_id, owner_id, role, joined_at, PRIMARY KEY(room, session_id))
-messages(id PK, room, from_id, to_id, kind, body, ref_id, created_at, read_at)
+messages(id PK, room, from_id, to_id,        -- session ids (delivery address)
+         from_owner, to_owner,               -- userIds (identity — for user-level history)
+         kind, body, ref_id, created_at, read_at)
 ```
 
 - `sessions.meta` is a JSON blob for extension fields (no migration needed to add one).

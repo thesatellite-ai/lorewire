@@ -100,8 +100,10 @@ members(                         -- per-session room membership
 messages(
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   room       TEXT NOT NULL DEFAULT 'main',
-  from_id    TEXT NOT NULL,      -- sender session_id
+  from_id    TEXT NOT NULL,      -- sender session_id (the delivery address)
   to_id      TEXT NOT NULL,      -- recipient session_id (fan-out resolved at send time)
+  from_owner TEXT,               -- sender userId (the identity — for user-level history)
+  to_owner   TEXT,               -- recipient userId
   kind       TEXT NOT NULL DEFAULT 'msg',  -- msg | request | secret | deny
   body       TEXT NOT NULL,
   ref_id     INTEGER,            -- for grant/deny: the request message id
@@ -116,6 +118,7 @@ Key modeling decisions:
 - **`members` is per-session.** When bob has three terminals in a room, that's three membership rows. Delivery is per-terminal, so this lines up naturally, and grouping by `owner_id` gives the per-user view for free.
 - **`members.owner_id` is denormalized** (also derivable via `sessions`). Safe, because a session's owner never changes, and it lets us group/scope by user without a join.
 - **Fan-out at send time.** A broadcast / `@role` / username send expands into **one `messages` row per recipient session**, each with its own `read_at`. So `recv` is a plain "unread rows where `to_id` = me" query, and consume-once holds even under racing readers.
+- **Identity recorded on messages.** Each message stores `from_owner`/`to_owner` (userIds) alongside the session ids. Delivery is by session (`to_id`), but *history is by user*: `recv` consumes a session's mail, while `inbox`/`log`/`user sessions` key on the userId, so history survives session churn and rename (identity outlives sessions). Existing rows are backfilled from the `username~` session-id prefix on migration.
 - **`meta`** is an intentionally-reserved JSON column for future freeform fields, so adding one never needs a migration.
 
 ## How a message flows

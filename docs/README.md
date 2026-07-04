@@ -18,6 +18,10 @@ The full knowledge base for lorewire — a message bus for AI coding agent sessi
 - **[Integrations](INTEGRATIONS.md)** — wire lorewire into an agent: Claude Code hooks in depth, plus the generic recipe for any agent (Codex, opencode, …) and plain scripts/CI. Includes a troubleshooting table.
 - **[Reference](REFERENCE.md)** — the complete manual: every command, flag, environment variable, config key, addressing form, hook, schema table, exit code, and recipe.
 
+## Roadmap
+
+- **[Tasks / roadmap](TASKS.md)** — open work: Codex & opencode integration, CI/CD, GoReleaser, full unit-test coverage, the ent/typesafe migration, and deferred features — each with detail to pick up cold.
+
 ## Also in the repo
 
 - [`../PLAN.md`](../PLAN.md) — the design/decision log for the identity + config layer.

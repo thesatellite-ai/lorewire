@@ -28,6 +28,14 @@ Quick definitions of every lorewire term. For the full picture see [ARCHITECTURE
 
 **kind** — A message's type: `msg` (normal), `request`, `secret`, `deny`. Drives display and delivery semantics.
 
+**message owner (`from_owner` / `to_owner`)** — The **userId** of a message's sender and recipient, recorded on the message alongside the session ids. Because identity outlives sessions, this is what powers user-level history (`log --user`, user-scoped `inbox`) — robust to session churn and rename.
+
+**transcript / log** — A read-only view of message history (`lorewire log`), not scoped to your current session. By room (all participants) and/or by user (keyed on userId, spanning all their past sessions). Does not consume.
+
+**historical session** — A session id a user *used to have* — it left or was pruned, but survives in message history. Listed (distinct from live sessions) by `lorewire user sessions NAME`.
+
+**user-scoped inbox** — `lorewire inbox` shows a *user's* mail across all their sessions (keyed on `to_owner`), vs `recv` which consumes a single *session's* mail. Narrow with `--session ID`.
+
 **broadcast** — `--to all` (or `*`): deliver to every member of the room.
 
 **@role addressing** — `--to @dev`: deliver to every member of the room holding that role.

@@ -96,13 +96,23 @@ type Room struct {
 type Message struct {
 	ID        int64
 	Room      string
-	From      string // sender session id
+	From      string // sender session id (delivery address)
 	To        string // recipient session id
+	FromOwner string // sender userId (identity — for user-level history)
+	ToOwner   string // recipient userId
 	Kind      string
 	Body      string
 	RefID     *int64
 	CreatedAt time.Time
 	ReadAt    *time.Time
+}
+
+// recipient is one resolved delivery target: the session id it lands on plus the
+// userId that owns it, so a message records the recipient's identity (not just
+// its transient session).
+type recipient struct {
+	ID    string // session id
+	Owner string // userId that owns the session ("" if the session is unknown)
 }
 
 // Store wraps the SQLite handle.
@@ -270,8 +280,10 @@ CREATE TABLE IF NOT EXISTS members (
 CREATE TABLE IF NOT EXISTS messages (
 	id         INTEGER PRIMARY KEY AUTOINCREMENT,
 	room       TEXT NOT NULL DEFAULT 'main',
-	from_id    TEXT NOT NULL,
-	to_id      TEXT NOT NULL,
+	from_id    TEXT NOT NULL,      -- sender session id (the delivery address)
+	to_id      TEXT NOT NULL,      -- recipient session id
+	from_owner TEXT,               -- sender userId (the identity — for user-level history)
+	to_owner   TEXT,               -- recipient userId
 	kind       TEXT NOT NULL DEFAULT 'msg',
 	body       TEXT NOT NULL,
 	ref_id     INTEGER,
@@ -282,6 +294,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_to_unread ON messages(to_id, read_at);
 CREATE INDEX IF NOT EXISTS idx_members_room ON members(room);
 CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id);
 `)
+	// NOTE: indexes on the owner columns are created AFTER the additive migration
+	// below — on an existing DB those columns don't exist until the ALTER runs.
 	if err != nil {
 		return err
 	}
@@ -310,6 +324,36 @@ CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id);
 				return err
 			}
 		}
+	}
+	// messages owner columns (identity-level history), added + backfilled once.
+	for col := range map[string]struct{}{"from_owner": {}, "to_owner": {}} {
+		ok, err := s.columnExists("messages", col)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err := s.db.Exec("ALTER TABLE messages ADD COLUMN " + col + " TEXT"); err != nil {
+				return err
+			}
+		}
+	}
+	// Backfill owners for pre-existing rows by mapping the "username~" prefix of
+	// the session id to a userId. Runs only against still-NULL rows, so it's a
+	// one-time, idempotent fill; renamed/removed users just stay NULL.
+	for _, pair := range [][2]string{{"from_owner", "from_id"}, {"to_owner", "to_id"}} {
+		if _, err := s.db.Exec(fmt.Sprintf(
+			`UPDATE messages SET %[1]s = (
+			   SELECT u.user_id FROM users u
+			   WHERE u.username = substr(%[2]s, 1, instr(%[2]s, '~') - 1)
+			 ) WHERE %[1]s IS NULL AND instr(%[2]s, '~') > 0`, pair[0], pair[1])); err != nil {
+			return err
+		}
+	}
+	// Now that the owner columns are guaranteed to exist, index them.
+	if _, err := s.db.Exec(`
+CREATE INDEX IF NOT EXISTS idx_messages_to_owner ON messages(to_owner, read_at);
+CREATE INDEX IF NOT EXISTS idx_messages_from_owner ON messages(from_owner);`); err != nil {
+		return err
 	}
 	now := time.Now().UTC().Format(timeFmt)
 	_, err = s.db.Exec(
@@ -643,6 +687,42 @@ FROM sessions se JOIN users u ON u.user_id = se.owner_id`
 		out = append(out, se)
 	}
 	return out, rows.Err()
+}
+
+// UserSessions returns a user's session ids: the currently-live ones (full rows)
+// plus historical session ids that only survive in message history (a session
+// that has since left/been pruned but sent or received messages). Historical
+// excludes any id that is still live. This is how "all sessions a user ever had"
+// is answered — identity outlives any single session.
+func (s *Store) UserSessions(ownerID string) (live []Session, historical []string, err error) {
+	live, err = s.Sessions(ownerID)
+	if err != nil {
+		return nil, nil, err
+	}
+	liveSet := make(map[string]struct{}, len(live))
+	for _, se := range live {
+		liveSet[se.ID] = struct{}{}
+	}
+	rows, err := s.db.Query(`
+SELECT sid FROM (
+  SELECT from_id AS sid FROM messages WHERE from_owner = ?
+  UNION
+  SELECT to_id AS sid FROM messages WHERE to_owner = ?
+) ORDER BY sid`, ownerID, ownerID)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, nil, err
+		}
+		if _, isLive := liveSet[sid]; !isLive {
+			historical = append(historical, sid)
+		}
+	}
+	return live, historical, rows.Err()
 }
 
 // ── Rooms & membership ──────────────────────────────────────────────────────
@@ -1001,47 +1081,52 @@ WHERE m.room = ? ORDER BY u.username, m.session_id`, room)
 //   - otherwise        → a username: all that user's sessions in the room
 //
 // The sender's own session is always excluded from fan-out.
-func (s *Store) resolveRecipients(room, fromSession, to string) ([]string, error) {
+func (s *Store) resolveRecipients(room, fromSession, to string) ([]recipient, error) {
 	switch {
 	case strings.HasPrefix(to, addrRolePrefix):
-		return s.queryNames(
-			`SELECT session_id FROM members WHERE room = ? AND role = ? AND session_id != ? ORDER BY session_id`,
+		return s.queryRecipients(
+			`SELECT session_id, owner_id FROM members WHERE room = ? AND role = ? AND session_id != ? ORDER BY session_id`,
 			room, strings.TrimPrefix(to, addrRolePrefix), fromSession)
 	case to == addrAll || to == addrAllStar:
-		return s.queryNames(
-			`SELECT session_id FROM members WHERE room = ? AND session_id != ? ORDER BY session_id`, room, fromSession)
+		return s.queryRecipients(
+			`SELECT session_id, owner_id FROM members WHERE room = ? AND session_id != ? ORDER BY session_id`, room, fromSession)
 	case strings.Contains(to, sessionSep):
-		return []string{to}, nil
+		// Literal session id — look up its owner (blank if the session isn't
+		// registered; the message still delivers and the id embeds the username).
+		var owner sql.NullString
+		s.db.QueryRow(`SELECT owner_id FROM sessions WHERE session_id = ?`, to).Scan(&owner)
+		return []recipient{{ID: to, Owner: owner.String}}, nil
 	default:
 		// username → that user's sessions that are members of this room
-		return s.queryNames(`
-SELECT m.session_id FROM members m
+		return s.queryRecipients(`
+SELECT m.session_id, m.owner_id FROM members m
 JOIN users u ON u.user_id = m.owner_id
 WHERE m.room = ? AND u.username = ? AND m.session_id != ? ORDER BY m.session_id`,
 			room, to, fromSession)
 	}
 }
 
-func (s *Store) queryNames(q string, args ...any) ([]string, error) {
+func (s *Store) queryRecipients(q string, args ...any) ([]recipient, error) {
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []string
+	var out []recipient
 	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
+		var r recipient
+		if err := rows.Scan(&r.ID, &r.Owner); err != nil {
 			return nil, err
 		}
-		out = append(out, n)
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }
 
-// Send delivers body from->to within room. Returns concrete recipient session
-// ids so the caller can warn on an empty fan-out.
-func (s *Store) Send(room, fromSession, to, body, kind string, ref *int64) ([]string, error) {
+// Send delivers body from->to within room. fromOwner is the sender's userId (so
+// each message records both parties' identities, not just their sessions).
+// Returns the concrete recipients so the caller can warn on an empty fan-out.
+func (s *Store) Send(room, fromSession, fromOwner, to, body, kind string, ref *int64) ([]recipient, error) {
 	if kind == "" {
 		kind = msgKind
 	}
@@ -1058,8 +1143,9 @@ func (s *Store) Send(room, fromSession, to, body, kind string, ref *int64) ([]st
 		defer tx.Rollback()
 		for _, r := range recipients {
 			if _, err := tx.Exec(
-				`INSERT INTO messages (room, from_id, to_id, kind, body, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-				room, fromSession, r, kind, body, ref, now); err != nil {
+				`INSERT INTO messages (room, from_id, to_id, from_owner, to_owner, kind, body, ref_id, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				room, fromSession, r.ID, fromOwner, r.Owner, kind, body, ref, now); err != nil {
 				return err
 			}
 		}
@@ -1073,8 +1159,9 @@ func (s *Store) Send(room, fromSession, to, body, kind string, ref *int64) ([]st
 }
 
 // answerRequest delivers a reply (secret or deny) to the requester of a request
-// message and marks the request consumed. Returns requester session id + room.
-func (s *Store) answerRequest(reqID int64, granterSession, replyKind, body string) (requester, room string, err error) {
+// message and marks the request consumed. granterOwner is the answering user's
+// userId. Returns requester session id + room.
+func (s *Store) answerRequest(reqID int64, granterSession, granterOwner, replyKind, body string) (requester, room string, err error) {
 	now := time.Now().UTC().Format(timeFmt)
 	err = withRetry(func() error {
 		requester, room = "", ""
@@ -1084,8 +1171,9 @@ func (s *Store) answerRequest(reqID int64, granterSession, replyKind, body strin
 		}
 		defer tx.Rollback()
 		var kind string
+		var reqOwner sql.NullString
 		if err := tx.QueryRow(
-			`SELECT room, from_id, kind FROM messages WHERE id = ?`, reqID).Scan(&room, &requester, &kind); err != nil {
+			`SELECT room, from_id, from_owner, kind FROM messages WHERE id = ?`, reqID).Scan(&room, &requester, &reqOwner, &kind); err != nil {
 			if err == sql.ErrNoRows {
 				return fmt.Errorf("no request with id %d", reqID)
 			}
@@ -1095,8 +1183,9 @@ func (s *Store) answerRequest(reqID int64, granterSession, replyKind, body strin
 			return fmt.Errorf("message %d is not a request (kind=%s)", reqID, kind)
 		}
 		if _, err := tx.Exec(
-			`INSERT INTO messages (room, from_id, to_id, kind, body, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			room, granterSession, requester, replyKind, body, reqID, now); err != nil {
+			`INSERT INTO messages (room, from_id, to_id, from_owner, to_owner, kind, body, ref_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			room, granterSession, requester, granterOwner, reqOwner.String, replyKind, body, reqID, now); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`UPDATE messages SET read_at = ? WHERE id = ?`, now, reqID); err != nil {
@@ -1111,12 +1200,12 @@ func (s *Store) answerRequest(reqID int64, granterSession, replyKind, body strin
 	return requester, room, nil
 }
 
-func (s *Store) Grant(reqID int64, granterSession, secret string) (string, string, error) {
-	return s.answerRequest(reqID, granterSession, secretKind, secret)
+func (s *Store) Grant(reqID int64, granterSession, granterOwner, secret string) (string, string, error) {
+	return s.answerRequest(reqID, granterSession, granterOwner, secretKind, secret)
 }
 
-func (s *Store) Deny(reqID int64, granterSession, reason string) (string, string, error) {
-	return s.answerRequest(reqID, granterSession, denyKind, reason)
+func (s *Store) Deny(reqID int64, granterSession, granterOwner, reason string) (string, string, error) {
+	return s.answerRequest(reqID, granterSession, granterOwner, denyKind, reason)
 }
 
 // Recv returns unread messages for a session and consumes them: normal messages
@@ -1187,12 +1276,19 @@ func (s *Store) Recv(sessionID, room string) ([]Message, error) {
 	return out, nil
 }
 
-// Inbox returns messages for a session without consuming them. Secret bodies are
-// masked so a peek can't leak a key.
-func (s *Store) Inbox(sessionID, room string, all bool) ([]Message, error) {
+// Inbox returns messages for a USER — across all of that user's sessions —
+// without consuming them (peek). session != "" narrows to one of the user's
+// sessions; room scopes to a room; all includes already-read history. Secret
+// bodies are masked so a peek can't leak a key. Keyed on to_owner (the identity)
+// rather than a single session, because a user owns many sessions.
+func (s *Store) Inbox(ownerID, session, room string, all bool) ([]Message, error) {
 	q := `SELECT id, room, from_id, to_id, kind, body, ref_id, created_at, read_at
-	      FROM messages WHERE to_id = ?`
-	args := []any{sessionID}
+	      FROM messages WHERE to_owner = ?`
+	args := []any{ownerID}
+	if session != "" {
+		q += ` AND to_id = ?`
+		args = append(args, session)
+	}
 	if room != "" {
 		q += ` AND room = ?`
 		args = append(args, room)
@@ -1229,4 +1325,74 @@ func (s *Store) Inbox(sessionID, room string, all bool) ([]Message, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// MessagesLog returns a read-only transcript WITHOUT consuming anything — for
+// `lorewire log`. It is NOT filtered by recipient (unlike Inbox), so it surfaces
+// the full history including messages addressed to session ids that no longer
+// exist.
+//
+//   - room "" (or "all") spans every room; otherwise scopes to that room.
+//   - ownerID "" spans all participants; otherwise matches messages the user
+//     sent OR received, keyed on the userId (the identity) — so it catches every
+//     session that user ever had, robust to session churn and rename.
+//   - limit>0 keeps only the most recent N; results are returned oldest-first.
+//
+// Unconsumed secrets are masked (consumed ones are already hard-deleted).
+func (s *Store) MessagesLog(room, ownerID string, limit int) ([]Message, error) {
+	q := `SELECT id, room, from_id, to_id, kind, body, ref_id, created_at, read_at FROM messages`
+	var conds []string
+	var args []any
+	if room != "" && room != addrAll {
+		conds = append(conds, "room = ?")
+		args = append(args, room)
+	}
+	if ownerID != "" {
+		conds = append(conds, "(from_owner = ? OR to_owner = ?)")
+		args = append(args, ownerID, ownerID)
+	}
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
+	}
+	// Most-recent-first for the LIMIT, then reversed below to read oldest-first.
+	q += " ORDER BY id DESC"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		var m Message
+		var created string
+		var ref sql.NullInt64
+		var read sql.NullString
+		if err := rows.Scan(&m.ID, &m.Room, &m.From, &m.To, &m.Kind, &m.Body, &ref, &created, &read); err != nil {
+			return nil, err
+		}
+		m.CreatedAt, _ = time.Parse(timeFmt, created)
+		if ref.Valid {
+			m.RefID = &ref.Int64
+		}
+		if read.Valid {
+			t, _ := time.Parse(timeFmt, read.String)
+			m.ReadAt = &t
+		}
+		if m.Kind == secretKind {
+			m.Body = "<secret — consumed on read>"
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Reverse to oldest-first for natural reading order.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
 }
