@@ -1,0 +1,54 @@
+version: '3'
+
+vars:
+  BIN: lorewire
+
+tasks:
+  build:
+    desc: Build the lorewire binary into the repo root
+    cmds:
+      - go build -o {{.BIN}} .
+
+  install:
+    desc: Build and install lorewire into $GOBIN (or ~/go/bin) so every session can call it
+    cmds:
+      - go install .
+
+  tidy:
+    desc: Sync go.mod / go.sum
+    cmds:
+      - go mod tidy
+
+  test-e2e:
+    desc: Run the end-to-end multi-session scenario against a throwaway DB
+    cmds:
+      - ./scripts/e2e.sh
+
+  test-rooms:
+    desc: Run the rooms/roles/request-grant scenario against a throwaway DB
+    cmds:
+      - ./scripts/e2e-rooms.sh
+
+  test:
+    desc: Run all end-to-end scenarios
+    cmds:
+      - task: test-e2e
+      - task: test-rooms
+
+  demo:
+    desc: Register alice/bob/carol in the default DB and show sessions
+    cmds:
+      - LOREWIRE_NAME=alice ./{{.BIN}} register
+      - LOREWIRE_NAME=bob   ./{{.BIN}} register
+      - LOREWIRE_NAME=carol ./{{.BIN}} register
+      - ./{{.BIN}} sessions
+
+  reset:
+    desc: Delete the default lorewire database (~/.lorewire)
+    cmds:
+      - rm -rf "${LOREWIRE_DB:-$HOME/.lorewire}"
+
+  clean:
+    desc: Remove the built binary
+    cmds:
+      - rm -f {{.BIN}}

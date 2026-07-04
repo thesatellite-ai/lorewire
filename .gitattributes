@@ -1,0 +1,23 @@
+# Normalize line endings — keep LF in the repo regardless of OS.
+* text=auto eol=lf
+
+# Shell scripts and Go stay LF.
+*.sh text eol=lf
+*.go text eol=lf
+
+# Binary assets (don't diff/normalize).
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
+*.db binary
+
+# Generated/vendored — collapse in diffs and exclude from language stats.
+*.lock linguist-generated=true
+go.sum linguist-generated=true
+vendor/** linguist-vendored
+dist/** linguist-generated=true

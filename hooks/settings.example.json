@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Volumes/D/khanakia/Downloads/claude_session_hub/hooks/lorewire-incoming.sh"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Volumes/D/khanakia/Downloads/claude_session_hub/hooks/lorewire-leave.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+/lorewire
+*.db
+*.db-wal
+*.db-shm

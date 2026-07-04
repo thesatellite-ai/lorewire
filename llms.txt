@@ -1,0 +1,26 @@
+# lorewire
+
+> A message bus for AI coding agent sessions to talk to each other. Local-first, agent-agnostic IPC for multi-agent workflows: register a name, message peers directly / by role / by broadcast, scope conversations into rooms, and hand secrets (like API keys) to role-holders via a consume-once request/grant flow. Single Go binary, SQLite-backed, no server.
+
+lorewire is open source (thesatellite-ai/lorewire). Everything runs locally; nothing is sent to the cloud, and no API key or account is required.
+
+## Docs
+- [README](https://github.com/thesatellite-ai/lorewire/blob/main/README.md): overview, install, usage, rooms/roles/secrets, hooks
+- [CHANGELOG](https://github.com/thesatellite-ai/lorewire/blob/main/CHANGELOG.md): release history
+- [CONTRIBUTING](https://github.com/thesatellite-ai/lorewire/blob/main/CONTRIBUTING.md): how to contribute
+- [SECURITY](https://github.com/thesatellite-ai/lorewire/blob/main/SECURITY.md): disclosure policy and scope
+
+## Install
+- Build from source: `go install github.com/thesatellite-ai/lorewire@latest`
+- Releases: https://github.com/thesatellite-ai/lorewire/releases
+
+## Concepts
+- Sessions register a name and exchange messages through a shared SQLite file.
+- Rooms scope conversations (default room "main", so rooms are optional).
+- Roles identify members (ceo, cto, dev…); messages can be addressed to a role with @role.
+- Secrets use a request/grant flow and are delivered consume-once (hard-deleted after one read).
+- An optional Claude Code hook auto-delivers incoming messages into a session.
+
+## Links
+- Repository: https://github.com/thesatellite-ai/lorewire
+- Homepage: https://github.com/thesatellite-ai/lorewire

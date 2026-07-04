@@ -1,0 +1,35 @@
+{
+  "name": "lorewire",
+  "tagline": "A message bus for AI coding agent sessions to talk to each other.",
+  "description": "lorewire is a tiny, agent-agnostic message bus that lets multiple AI coding agent sessions (Claude Code, other agents, or plain scripts) send and receive messages across separate terminals. Rooms scope conversations, roles identify who's who, and a request/grant flow delivers secrets (like API keys) consume-once. Single Go binary, pure-Go SQLite, no server.",
+  "repo": "thesatellite-ai/lorewire",
+  "homepage": "https://github.com/thesatellite-ai/lorewire",
+  "language": "go",
+  "kind": "cli",
+  "license": "Apache-2.0",
+  "author": "khanakia",
+  "authorEmail": "khanakia@gmail.com",
+  "year": 2026,
+  "topics": [
+    "cli",
+    "ai-agents",
+    "claude-code",
+    "message-bus",
+    "ipc",
+    "multi-agent",
+    "sqlite",
+    "golang",
+    "agent-communication",
+    "developer-tools"
+  ],
+  "positioning": {
+    "audience": "Developers running multiple AI coding agent sessions (Claude Code and others) who want those sessions to coordinate.",
+    "problem": "Agent sessions are isolated processes with no way to talk to each other, so multi-session workflows can't coordinate, hand off work, or share secrets.",
+    "solution": "A shared SQLite-backed CLI each session calls to register, message by name/role/broadcast, scope by room, and request secrets — with an optional hook that auto-delivers messages into a session.",
+    "alternatives": ["ad-hoc shared files", "tmux send-keys", "a custom HTTP broker", "copy-paste between terminals"]
+  },
+  "_shipRepo": {
+    "skipped": ["satl-brand-kit", "satl-ship-to-khanakia"],
+    "reason": "User scoped this run to optimize/OSS-readiness only; visual branding and the khanakia.com/apps card are intentionally out of scope."
+  }
+}
