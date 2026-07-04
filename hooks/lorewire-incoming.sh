@@ -13,7 +13,18 @@
 # context instead of a manual `lorewire recv`. That's the intended behavior.
 set -euo pipefail
 
-[ -z "${LOREWIRE_NAME:-}" ] && exit 0
+# Only act where lorewire is intended: either an identity is exported, or a
+# .lorewire.jsonc exists in this dir or an ancestor. Otherwise no-op so we don't
+# create stray sessions in unrelated projects.
+have_config() {
+	local d; d="$(pwd)"
+	while [ "$d" != "/" ]; do
+		[ -f "$d/.lorewire.jsonc" ] && return 0
+		d="$(dirname "$d")"
+	done
+	return 1
+}
+[ -n "${LOREWIRE_NAME:-}" ] || [ -n "${LOREWIRE_USER_ID:-}" ] || have_config || exit 0
 
 # Prefer an installed `lorewire`; fall back to a repo-local build if
 # LOREWIRE_BIN points at one.

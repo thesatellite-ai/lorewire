@@ -11,7 +11,15 @@
 # same $LOREWIRE_NAME re-registers and resumes history.
 set -euo pipefail
 
-[ -z "${LOREWIRE_NAME:-}" ] && exit 0
+have_config() {
+	local d; d="$(pwd)"
+	while [ "$d" != "/" ]; do
+		[ -f "$d/.lorewire.jsonc" ] && return 0
+		d="$(dirname "$d")"
+	done
+	return 1
+}
+[ -n "${LOREWIRE_NAME:-}" ] || [ -n "${LOREWIRE_USER_ID:-}" ] || have_config || exit 0
 
 LW="${LOREWIRE_BIN:-lorewire}"
 command -v "$LW" >/dev/null 2>&1 || exit 0

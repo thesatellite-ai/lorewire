@@ -2,3 +2,6 @@
 *.db
 *.db-wal
 *.db-shm
+# a config created while dev-testing lorewire inside its own repo (in real
+# projects .lorewire.jsonc IS meant to be committed)
+/.lorewire.jsonc

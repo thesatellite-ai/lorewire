@@ -29,11 +29,17 @@ tasks:
     cmds:
       - ./scripts/e2e-rooms.sh
 
+  test-identity:
+    desc: Run the identity/config (users, sessions, .lorewire.jsonc) scenario
+    cmds:
+      - ./scripts/e2e-identity.sh
+
   test:
     desc: Run all end-to-end scenarios
     cmds:
       - task: test-e2e
       - task: test-rooms
+      - task: test-identity
 
   demo:
     desc: Register alice/bob/carol in the default DB and show sessions

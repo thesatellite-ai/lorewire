@@ -13,7 +13,7 @@
 
 **lorewire** is a tiny, local-first, agent-agnostic **message bus** that lets multiple **AI coding agent sessions** — [Claude Code](https://claude.com/claude-code), other CLI agents, or plain shell scripts — send and receive messages across separate terminals. It's inter-process communication (IPC) for **multi-agent** workflows: register a name, then message peers **directly, by role, or by broadcast**, scope conversations into **rooms**, and hand secrets like **API keys** to whoever holds a role via a consume-once request/grant flow. One **Go** binary, pure-Go **SQLite** store, no server, no cloud, no API key.
 
-Delivery is pull-based (a session reads its inbox with `lorewire recv`), with an optional Claude Code hook that pushes incoming messages into a session automatically. `lorewire` is the comms sibling in the **lore** family — *lore agents talk over the lorewire.*
+Your **identity** (a stable `userId` + human `username`) and your default room/role live in a project-local `.lorewire.jsonc`, so opening a terminal in a project auto-configures it — no `export` every time. One identity owns many **sessions** (one per terminal). Delivery is pull-based (a session reads its inbox with `lorewire recv`), with an optional Claude Code hook that pushes incoming messages into a session automatically. `lorewire` is the comms sibling in the **lore** family — *lore agents talk over the lorewire.*
 
 ## Contents
 
@@ -21,6 +21,7 @@ Delivery is pull-based (a session reads its inbox with `lorewire recv`), with an
 - [Why this design](#why-this-design)
 - [Install](#install)
 - [Quickstart — wire two sessions together](#quickstart--wire-two-sessions-together)
+- [Identity & config](#identity--config)
 - [Rooms, roles & secrets](#rooms-roles--secrets)
 - [Commands](#commands)
 - [Push layer — auto-deliver into a session](#push-layer--auto-deliver-into-a-session-optional)
@@ -101,7 +102,60 @@ lorewire send --to alice "on it"
 lorewire send --to all "build is green, pushing now"
 ```
 
-`lorewire sessions` lists who's registered and when they were last active.
+`lorewire sessions` lists who's registered and when they were last active. That two-terminal flow is **quick mode**: just set `$LOREWIRE_NAME` and go — lorewire lazily creates the user for you. For anything ongoing, use a config file instead (next section).
+
+## Identity & config
+
+Retyping `export LOREWIRE_NAME=…` in every terminal gets old. Drop a `.lorewire.jsonc` in your project and lorewire self-configures from it — env vars and flags still override.
+
+**Your identity is two things:**
+
+- **username** — the human name you see: `bob`. Unique, and renameable.
+- **userId** — a stable, immutable id (`usr_k3n9x2p`) that everything secretly references, so a rename never breaks anything.
+
+Claim an identity once — it mints the userId and writes the config file for you:
+
+```bash
+cd ~/work/project-x
+lorewire user create bob --room project-x --role cto
+# → user "bob" → usr_k3n9x2p
+# → wrote ./.lorewire.jsonc
+```
+
+```jsonc
+// .lorewire.jsonc  (safe to commit — env vars override per person/terminal)
+{
+  "userId": "usr_k3n9x2p",
+  "room": "project-x",
+  "role": "cto"
+}
+```
+
+Now any terminal opened in that folder is already bob, in project-x, as cto — no exports:
+
+```bash
+lorewire register           # this terminal joins the room with your role
+lorewire whoami             # shows effective identity/room/role + where each came from
+```
+
+**One identity, many terminals.** Each terminal you open becomes its own **session** under your identity, auto-named `bob~a1f` (derived from the terminal). So `bob` with 3 terminals = 3 sessions, and:
+
+- `lorewire send --to bob "…"` reaches **all** of bob's terminals.
+- `lorewire send --to bob~a1f "…"` targets one specific terminal.
+
+**Resolution order** for every value: command flag → `$LOREWIRE_*` env → `.lorewire.jsonc` (nearest, walking up from the current dir) → built-in default. So the config is your baseline; export to override one terminal, pass a flag to override one command.
+
+**Reusing an identity.** In another project folder, point it at the same identity instead of making a new one:
+
+```bash
+lorewire init --username bob        # writes a .lorewire.jsonc here with bob's userId
+```
+
+On a fresh machine (the committed config has a userId your local DB doesn't know yet), re-establish it:
+
+```bash
+lorewire user create bob --id usr_k3n9x2p
+```
 
 ## Rooms, roles & secrets
 
@@ -150,11 +204,21 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 
 ## Commands
 
+**Identity & config**
+
+| Command | What it does |
+|---|---|
+| `lorewire user create NAME [--id usr_…] [--room R] [--role X]` | Claim a username (mint or `--id`-import a userId); writes `./.lorewire.jsonc`. |
+| `lorewire user list [--json]` | List users and their session counts. |
+| `lorewire user rename OLD NEW` | Rename a username (userId unchanged; cascades to live session handles). |
+| `lorewire init --username NAME \| --user usr_…` | Point this dir's `.lorewire.jsonc` at an existing identity. |
+| `lorewire whoami [--json]` | Show effective userId/username/session/room/role — and the source of each. |
+
 **Presence & rooms**
 
 | Command | What it does |
 |---|---|
-| `lorewire register --name NAME` | Register a session (joins the default room `main`). Idempotent heartbeat. |
+| `lorewire register [--new]` | Register this terminal's session and join the configured room with your role. `--new` forces a fresh session handle. |
 | `lorewire join --room ROOM [--role ROLE]` | Join a room (creating it if new — first joiner becomes owner). No `--role` → `guest`. |
 | `lorewire leave [--room ROOM] [--purge]` | Leave one room. `--purge` also deletes that room's inbox for you. |
 | `lorewire leave --all [--purge]` | Unregister from **every** room and remove the session (what the `SessionEnd` hook runs). |
@@ -168,7 +232,7 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 
 | Command | What it does |
 |---|---|
-| `lorewire send [--room ROOM] --to NAME\|@ROLE\|all MSG` | Send. `@ROLE` fans out to everyone with that role in the room; `all` to all members. `MSG` positional or `--msg`. |
+| `lorewire send [--room ROOM] --to NAME\|@ROLE\|all\|SESSION MSG` | Send. `NAME` fans out to all that user's sessions in the room; `@ROLE` to everyone with that role; `all` to all members; `SESSION` (`bob~a1f`) to one terminal. `MSG` positional or `--msg`. |
 | `lorewire recv [--room ROOM] [--json]` | Read **and consume** unread messages. Without `--room`, drains **all** your rooms at once. |
 | `lorewire inbox [--room ROOM] [--all] [--json]` | Show messages without consuming. Secret bodies are masked here. |
 | `lorewire watch [--room ROOM] [--interval 2s] [--json]` | Block and stream new messages as they arrive. |
@@ -181,7 +245,9 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 | `lorewire grant ID --secret VALUE` | Answer a request with a secret, delivered **consume-once** (hard-deleted after one `recv`). |
 | `lorewire deny ID REASON` | Decline a request; the requester is notified. |
 
-Identity for every command resolves from the flag (`--name` / `--from`), else `$LOREWIRE_NAME`. Room resolves from `--room`, else `$LOREWIRE_ROOM`, else `main`. Set both once per terminal and drop the flags.
+Identity resolves as: `--user`/`--name` flag → `$LOREWIRE_USER_ID`/`$LOREWIRE_NAME` env → `.lorewire.jsonc` userId. Room resolves: `--room` → `$LOREWIRE_ROOM` → `.lorewire.jsonc` room → `main`. Role likewise via `$LOREWIRE_ROLE` / config → `guest`. Put them in a `.lorewire.jsonc` (see [Identity & config](#identity--config)) and drop the flags entirely.
+
+For every flag, environment variable, addressing form, schema table, exit code, and more examples, see the **[complete reference manual](docs/REFERENCE.md)**.
 
 ## Push layer — auto-deliver into a session (optional)
 
@@ -283,7 +349,8 @@ lorewire sessions      # alice is gone; only bob remains
 ## Storage
 
 - Default database: `~/.lorewire/lorewire.db` (override with `$LOREWIRE_DB`).
-- Tables: `sessions` (global presence), `rooms`, `members` (`room`,`name`,`role`), `messages` (room-scoped, with `kind` and `read_at`).
+- Tables: `users` (`user_id`,`username`), `sessions` (one per terminal, owned by a user, with `cwd`/`tty`/`pid`/`host`/`client` + a `meta` JSON blob), `rooms`, `members` (`room`,`session_id`,`owner_id`,`role`), `messages` (room-scoped, `from_id`/`to_id` are session ids, with `kind` and `read_at`).
+- An incompatible pre-identity database is moved aside to `lorewire.db.bak-<timestamp>` (never silently wiped) and a fresh one is created.
 - WAL journal mode so readers proceed during writes; `busy_timeout` + retry-on-lock for cross-process contention.
 - A broadcast or `@role` send fans out at send time into one row per recipient, each with its own read watermark, so `recv` stays a simple "unread rows for me" query and consume-once holds even when two `recv` calls race.
 - Secret messages are deleted (not just marked read) on `recv`, so a key survives exactly one read.
@@ -291,12 +358,13 @@ lorewire sessions      # alice is gone; only bob remains
 ## Development
 
 ```bash
-task build        # build ./lorewire
-task test         # run all e2e scenarios
-task test-e2e     # flat-mode scenario (direct, broadcast, concurrency)
-task test-rooms   # rooms/roles/@role/request-grant scenario
-task demo         # register alice/bob/carol in the default DB and list sessions
-task reset        # delete the default database
+task build          # build ./lorewire
+task test           # run all e2e scenarios
+task test-e2e       # flat-mode scenario (direct, broadcast, concurrency)
+task test-rooms     # rooms/roles/@role/request-grant scenario
+task test-identity  # users, sessions, .lorewire.jsonc, precedence, rename
+task demo           # register alice/bob/carol in the default DB and list sessions
+task reset          # delete the default database
 ```
 
 ## FAQ
@@ -318,6 +386,12 @@ task reset        # delete the default database
 **What happens if a session crashes without unregistering?** Run `lorewire prune --older-than 30m` to remove stale sessions, or wire the `SessionEnd` hook so sessions auto-unregister with `lorewire leave --all` when they close.
 
 **How many sessions can talk at once?** It's designed for 2–3 coordinating agent sessions, but there's no hard limit — concurrent sends and reads are serialized safely through SQLite.
+
+## Documentation
+
+- **[Complete reference manual](docs/REFERENCE.md)** — every command, flag, environment variable, config key, addressing form, hook, schema table, exit code, and recipe.
+- [PLAN.md](PLAN.md) — design decisions and rationale for the identity/config layer.
+- `hooks/settings.example.json` — ready-to-merge Claude Code hook config.
 
 ## The lore family
 

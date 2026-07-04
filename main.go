@@ -1,11 +1,12 @@
 // Command lorewire is a tiny message bus that lets multiple agent sessions
 // (Claude Code, other agents, or plain scripts — separate processes) talk to
-// each other. Each session registers a name, then sends and receives messages
-// through a shared SQLite file. Messages are scoped to rooms (default "main",
-// so rooms are optional), members carry roles, and a request/grant flow lets an
-// agent ask a role-holder for a secret (e.g. an API key). It is pull-based (a
-// session reads its inbox when it wants); `lorewire watch` provides a blocking
-// poll loop that the push/hook layer builds on.
+// each other over a shared SQLite file.
+//
+// Identity is split into a stable user (userId + username) that owns many
+// sessions (one per terminal). A project-local .lorewire.jsonc supplies the
+// default identity/room/role so terminals self-configure; env vars and flags
+// override. Messages are room-scoped; a request/grant flow delivers secrets
+// consume-once.
 package main
 
 import (
@@ -28,6 +29,12 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "user":
+		err = cmdUser(args)
+	case "init":
+		err = cmdInit(args)
+	case "whoami":
+		err = cmdWhoami(args)
 	case "register":
 		err = cmdRegister(args)
 	case "join":
@@ -75,156 +82,443 @@ func main() {
 func usage() {
 	fmt.Print(`lorewire — message bus for talking between agent/Claude Code sessions
 
-Presence & rooms:
-  lorewire register --name NAME                register (joins default room "main")
-  lorewire join --room ROOM [--role ROLE]      join/create a room with a role
-  lorewire leave [--room ROOM] [--purge]       leave one room (--purge drops its inbox)
-  lorewire leave --all [--purge]               unregister from every room + session
-  lorewire prune [--older-than 30m]            remove sessions not seen since the cutoff
-  lorewire rooms [--json]                      list rooms and member counts
-  lorewire members [--room ROOM] [--json]      list a room's members and roles
-  lorewire role set NAME ROLE [--room ROOM]    change a member's role
-  lorewire sessions [--json]                   list all live sessions
+Identity & config:
+  lorewire user create NAME [--id usr_…]     claim a username (mint or import a userId); writes .lorewire.jsonc
+  lorewire user list                         list users and their session counts
+  lorewire user rename OLD NEW               rename a username (userId unchanged)
+  lorewire init --username NAME | --user ID  point this dir's .lorewire.jsonc at an existing identity
+  lorewire whoami                            show effective identity/room/role and where each came from
 
-Messaging (room resolves: --room flag > $LOREWIRE_ROOM > "main"):
-  lorewire send [--room ROOM] --to NAME|@ROLE|all MSG    send a message
-  lorewire recv [--room ROOM] [--json]         read + consume unread messages
-  lorewire inbox [--room ROOM] [--all] [--json]  show messages without consuming
-  lorewire watch [--room ROOM] [--interval 2s] [--json]  stream new messages
+Presence & rooms (room resolves: --room > $LOREWIRE_ROOM > .lorewire.jsonc > "main"):
+  lorewire register [--new]                  register this terminal's session and join the configured room
+  lorewire join --room ROOM [--role ROLE]    join/create a room with a role
+  lorewire leave [--room ROOM] [--purge]     leave one room
+  lorewire leave --all [--purge]             remove this terminal's session from every room
+  lorewire prune [--older-than 30m]          remove sessions not seen since the cutoff
+  lorewire rooms [--json]                    list rooms
+  lorewire members [--room ROOM] [--json]    list a room's members and roles
+  lorewire role set NAME|SESSION ROLE [--room ROOM]   change a member's role
+  lorewire sessions [--json]                 list live sessions grouped by user
 
-Requesting secrets (e.g. an API key from whoever holds a role):
-  lorewire request [--room ROOM] --to @ROLE|NAME MSG     ask; recipients see [request#ID]
-  lorewire grant ID --secret VALUE             answer a request with a consume-once secret
-  lorewire deny  ID REASON                      decline a request
+Messaging:
+  lorewire send [--room ROOM] --to NAME|@ROLE|all|SESSION MSG   send a message
+  lorewire recv [--room ROOM] [--json]       read + consume unread messages
+  lorewire inbox [--room ROOM] [--all] [--json]   show messages without consuming
+  lorewire watch [--room ROOM] [--interval 2s]    stream new messages
 
-Identity resolves from --name/--from, else $LOREWIRE_NAME.
+Requesting secrets:
+  lorewire request [--room ROOM] --to @ROLE|NAME MSG   ask; recipients see [request#ID]
+  lorewire grant ID --secret VALUE           answer a request with a consume-once secret
+  lorewire deny  ID REASON                    decline a request
+
+Identity resolves from flags, else $LOREWIRE_USER_ID / $LOREWIRE_NAME, else .lorewire.jsonc.
 Database: $LOREWIRE_DB, else ~/.lorewire/lorewire.db
-
-Examples:
-  export LOREWIRE_NAME=alice && lorewire register
-  lorewire send --to bob "can you take the frontend?"          # in "main"
-  lorewire join --room project-x --role cto
-  lorewire send --room project-x --to @dev "standup in 5"      # address a role
-  lorewire request --room project-x --to @cto "OpenAI API key"
-  lorewire grant 12 --secret "sk-..."
 `)
 }
 
-// resolveName picks the identity from an explicit flag value or $LOREWIRE_NAME,
-// erroring if neither is set so a mistyped command can't act as the wrong peer.
-func resolveName(flagVal string) (string, error) {
-	if flagVal != "" {
-		return flagVal, nil
-	}
-	if env := os.Getenv("LOREWIRE_NAME"); env != "" {
-		return env, nil
-	}
-	return "", fmt.Errorf("no session name: pass --name/--from or set $LOREWIRE_NAME")
+// ── Identity resolution ─────────────────────────────────────────────────────
+
+// ident is the resolved context for a command: who we are (user + session),
+// which room, and what role — plus where each value came from (for whoami).
+type ident struct {
+	userID, username, sessionID, room, role string
+	srcUser, srcRoom, srcRole               string
 }
 
-// resolveRoom picks the room from --room, else $LOREWIRE_ROOM, else the default
-// room. This is what makes rooms optional — omit everything and you're in "main".
-func resolveRoom(flagVal string) string {
-	if flagVal != "" {
-		return flagVal
+// pick returns the first non-empty value from the given (value, source) pairs.
+type srcVal struct{ val, src string }
+
+func pick(pairs ...srcVal) (string, string) {
+	for _, p := range pairs {
+		if p.val != "" {
+			return p.val, p.src
+		}
 	}
-	if env := os.Getenv("LOREWIRE_ROOM"); env != "" {
-		return env
-	}
-	return defaultRoom
+	return "", "default"
 }
 
-func cmdRegister(args []string) error {
-	fs := flag.NewFlagSet("register", flag.ExitOnError)
-	name := fs.String("name", "", "session name")
-	fs.Parse(args)
-	n, err := resolveName(*name)
+// resolveIdentity computes the effective identity WITHOUT writing to the DB.
+// Precedence per value: flag > env > .lorewire.jsonc > default. userId (if
+// present anywhere) is authoritative and must exist in the DB; otherwise we
+// fall back to quick-mode username (auto-created). ensure=true creates the user
+// for quick-mode; ensure=false (read-only, e.g. whoami) leaves it unresolved.
+func resolveIdentity(st *Store, fUser, fName, fRoom, fRole string, ensure bool) (ident, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return ident{}, err
+	}
+	var id ident
+
+	// Identity resolves as a whole across userId and username, so a flag or env
+	// beats a lower layer regardless of which *kind* it is. Order (first wins):
+	//   1. --user (userId)   2. --name (username)
+	//   3. $LOREWIRE_USER_ID 4. $LOREWIRE_NAME
+	//   5. config userId
+	// This way an explicit $LOREWIRE_NAME=dave overrides a dir's committed
+	// userId, instead of the config silently winning.
+	byID := func(uid, src string) error {
+		name, ok, err := st.UserByID(uid)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf(
+				"userId %q is not in this database — run `lorewire user create <name> --id %s` to import it, or fix %s",
+				uid, uid, cfg.Path)
+		}
+		id.userID, id.username, id.srcUser = uid, name, src
+		return nil
+	}
+	byName := func(name, src string) error {
+		if ensure {
+			uid2, err := st.EnsureUser(name)
+			if err != nil {
+				return err
+			}
+			id.userID = uid2
+		}
+		id.username, id.srcUser = name, src
+		return nil
+	}
+	switch {
+	case fUser != "":
+		if err := byID(fUser, "flag"); err != nil {
+			return ident{}, err
+		}
+	case fName != "":
+		if err := byName(fName, "flag"); err != nil {
+			return ident{}, err
+		}
+	case os.Getenv("LOREWIRE_USER_ID") != "":
+		if err := byID(os.Getenv("LOREWIRE_USER_ID"), "env"); err != nil {
+			return ident{}, err
+		}
+	case os.Getenv("LOREWIRE_NAME") != "":
+		if err := byName(os.Getenv("LOREWIRE_NAME"), "env"); err != nil {
+			return ident{}, err
+		}
+	case cfg.UserID != "":
+		if err := byID(cfg.UserID, "config"); err != nil {
+			return ident{}, err
+		}
+	default:
+		return ident{}, fmt.Errorf(
+			"no identity: run `lorewire user create <name>` (writes .lorewire.jsonc), or set $LOREWIRE_NAME")
+	}
+
+	id.sessionID, _ = pick(
+		srcVal{os.Getenv("LOREWIRE_SESSION"), "env"},
+		srcVal{sessionID(id.username), "auto"},
+	)
+	id.room, id.srcRoom = pick(
+		srcVal{fRoom, "flag"},
+		srcVal{os.Getenv("LOREWIRE_ROOM"), "env"},
+		srcVal{cfg.Room, "config"},
+		srcVal{defaultRoom, "default"},
+	)
+	id.role, id.srcRole = pick(
+		srcVal{fRole, "flag"},
+		srcVal{os.Getenv("LOREWIRE_ROLE"), "env"},
+		srcVal{cfg.Role, "config"},
+		srcVal{roleGuest, "default"},
+	)
+	return id, nil
+}
+
+// ctx resolves identity and ensures this terminal's session row exists (upsert
+// with best-effort context). Used by every command that acts as a session.
+func ctx(st *Store, fUser, fName, fRoom, fRole string, fullContext bool) (ident, error) {
+	id, err := resolveIdentity(st, fUser, fName, fRoom, fRole, true)
+	if err != nil {
+		return ident{}, err
+	}
+	sess := Session{ID: id.sessionID, OwnerID: id.userID}
+	if fullContext {
+		sess.CWD, _ = os.Getwd()
+		sess.TTY = ttyName()
+		sess.PID = os.Getppid()
+		sess.Host, _ = os.Hostname()
+		sess.Client = clientKind()
+	}
+	if err := st.RegisterSession(sess); err != nil {
+		return ident{}, err
+	}
+	return id, nil
+}
+
+// ── Identity commands ───────────────────────────────────────────────────────
+
+func cmdUser(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lorewire user create|list|rename …")
+	}
+	switch args[0] {
+	case "create":
+		return cmdUserCreate(args[1:])
+	case "list":
+		return cmdUserList(args[1:])
+	case "rename":
+		return cmdUserRename(args[1:])
+	default:
+		return fmt.Errorf("unknown user subcommand %q (create|list|rename)", args[0])
+	}
+}
+
+func cmdUserCreate(args []string) error {
+	// NAME is the leading positional; Go's flag parser stops at the first
+	// non-flag token, so take the name off before parsing the flags.
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return fmt.Errorf("usage: lorewire user create NAME [--id usr_…] [--room R] [--role X]")
+	}
+	name := args[0]
+	fs := flag.NewFlagSet("user create", flag.ExitOnError)
+	id := fs.String("id", "", "reuse an existing userId (import) instead of minting one")
+	noWrite := fs.Bool("no-write", false, "do not write .lorewire.jsonc")
+	room := fs.String("room", "", "room to seed in the written config")
+	role := fs.String("role", "", "role to seed in the written config")
+	fs.Parse(args[1:])
+	st, err := openStore()
 	if err != nil {
 		return err
+	}
+	defer st.Close()
+	userID, err := st.CreateUser(name, *id)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("user %q → %s\n", name, userID)
+	if !*noWrite {
+		path, err := writeConfig("", userID, *room, *role)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("wrote %s\n", path)
+	}
+	return nil
+}
+
+func cmdUserList(args []string) error {
+	fs := flag.NewFlagSet("user list", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.Parse(args)
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	users, err := st.ListUsers()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(users)
+	}
+	if len(users) == 0 {
+		fmt.Println("(no users)")
+		return nil
+	}
+	for _, u := range users {
+		fmt.Printf("%-16s  %s  %d session(s)\n", u.Username, u.ID, u.Sessions)
+	}
+	return nil
+}
+
+func cmdUserRename(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: lorewire user rename OLD NEW")
 	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	if err := st.Register(n); err != nil {
+	if err := st.RenameUser(args[0], args[1]); err != nil {
 		return err
 	}
-	fmt.Printf("registered %q (in room %q)\n", n, defaultRoom)
+	fmt.Printf("renamed %q → %q\n", args[0], args[1])
+	return nil
+}
+
+func cmdInit(args []string) error {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	username := fs.String("username", "", "existing username to point this dir at")
+	user := fs.String("user", "", "existing userId to point this dir at")
+	room := fs.String("room", "", "default room for this dir")
+	role := fs.String("role", "", "your role in this dir")
+	fs.Parse(args)
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	userID := *user
+	if userID == "" && *username != "" {
+		id, ok, err := st.UserByName(*username)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no user named %q — create it with `lorewire user create %s`", *username, *username)
+		}
+		userID = id
+	}
+	if userID == "" {
+		return fmt.Errorf("provide --username NAME or --user usr_… of an existing identity")
+	}
+	if _, ok, err := st.UserByID(userID); err != nil {
+		return err
+	} else if !ok {
+		return fmt.Errorf("no user with id %q", userID)
+	}
+	path, err := writeConfig("", userID, *room, *role)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s (userId %s)\n", path, userID)
+	return nil
+}
+
+func cmdWhoami(args []string) error {
+	fs := flag.NewFlagSet("whoami", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "output JSON")
+	fs.Parse(args)
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	id, err := resolveIdentity(st, "", "", "", "", false)
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return printJSON(map[string]any{
+			"userId": id.userID, "username": id.username, "session": id.sessionID,
+			"room": id.room, "role": id.role,
+			"sources": map[string]string{"identity": id.srcUser, "room": id.srcRoom, "role": id.srcRole},
+		})
+	}
+	cfg, _ := loadConfig()
+	fmt.Printf("username : %s (%s)\n", id.username, id.srcUser)
+	if id.userID != "" {
+		fmt.Printf("userId   : %s\n", id.userID)
+	} else {
+		fmt.Printf("userId   : (not yet created — quick mode; run `lorewire register` to claim)\n")
+	}
+	fmt.Printf("session  : %s\n", id.sessionID)
+	fmt.Printf("room     : %s (%s)\n", id.room, id.srcRoom)
+	fmt.Printf("role     : %s (%s)\n", id.role, id.srcRole)
+	if cfg.Path != "" {
+		fmt.Printf("config   : %s\n", cfg.Path)
+	} else {
+		fmt.Printf("config   : (none found)\n")
+	}
+	return nil
+}
+
+// ── Presence & rooms ────────────────────────────────────────────────────────
+
+func cmdRegister(args []string) error {
+	fs := flag.NewFlagSet("register", flag.ExitOnError)
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override (quick mode)")
+	fRoom := fs.String("room", "", "room override")
+	fRole := fs.String("role", "", "role override")
+	newSess := fs.Bool("new", false, "force a fresh session handle for this terminal")
+	fs.Parse(args)
+	if *newSess {
+		// Rotate the session token so this terminal gets a distinct handle.
+		os.Setenv("LOREWIRE_SESSION_TOKEN", terminalToken()+"-"+nanoID(4))
+	}
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true)
+	if err != nil {
+		return err
+	}
+	created, owner, err := st.Join(id.room, id.sessionID, id.userID, id.role)
+	if err != nil {
+		return err
+	}
+	_ = owner
+	verb := "joined"
+	if created {
+		verb = "created + joined"
+	}
+	fmt.Printf("registered session %s (user %s) — %s room %q as %s\n",
+		id.sessionID, id.username, verb, id.room, id.role)
 	return nil
 }
 
 func cmdJoin(args []string) error {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
-	name := fs.String("name", "", "session name")
-	room := fs.String("room", "", "room to join (or $LOREWIRE_ROOM)")
-	role := fs.String("role", "", "your role in the room (default: guest)")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override")
+	fRoom := fs.String("room", "", "room to join")
+	fRole := fs.String("role", "", "role in the room")
 	fs.Parse(args)
-	n, err := resolveName(*name)
-	if err != nil {
-		return err
-	}
-	r := resolveRoom(*room)
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	created, owner, err := st.Join(r, n, *role)
+	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true)
 	if err != nil {
 		return err
 	}
-	roleShown := *role
-	if roleShown == "" {
-		roleShown = roleGuest
+	created, owner, err := st.Join(id.room, id.sessionID, id.userID, id.role)
+	if err != nil {
+		return err
 	}
 	if created {
-		fmt.Printf("created room %q and joined as %q (role %s, you are owner)\n", r, n, roleShown)
+		fmt.Printf("created room %q and joined as %s (role %s, you are owner)\n", id.room, id.username, id.role)
 	} else {
-		fmt.Printf("joined room %q as %q (role %s, owner %s)\n", r, n, roleShown, owner)
+		fmt.Printf("joined room %q as %s (role %s, owner %s)\n", id.room, id.username, id.role, owner)
 	}
 	return nil
 }
 
 func cmdLeave(args []string) error {
 	fs := flag.NewFlagSet("leave", flag.ExitOnError)
-	name := fs.String("name", "", "session name to unregister")
-	room := fs.String("room", "", "room to leave (or $LOREWIRE_ROOM)")
-	all := fs.Bool("all", false, "leave every room and remove the session entirely")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override")
+	fRoom := fs.String("room", "", "room to leave")
+	all := fs.Bool("all", false, "remove this session from every room")
 	purge := fs.Bool("purge", false, "also delete this session's inbox")
 	fs.Parse(args)
-	n, err := resolveName(*name)
-	if err != nil {
-		return err
-	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-
+	id, err := resolveIdentity(st, *fUser, *fName, *fRoom, "", true)
+	if err != nil {
+		return err
+	}
 	if *all {
-		rooms, err := st.LeaveAll(n, *purge)
+		rooms, err := st.LeaveSession(id.sessionID, *purge)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("unregistered %q (left %d room(s), session removed%s)\n", n, rooms, purgeNote(*purge))
+		fmt.Printf("removed session %s (left %d room(s)%s)\n", id.sessionID, rooms, purgeNote(*purge))
 		return nil
 	}
-
-	r := resolveRoom(*room)
-	existed, purged, err := st.Leave(r, n, *purge)
+	existed, purged, err := st.LeaveRoom(id.room, id.sessionID, *purge)
 	if err != nil {
 		return err
 	}
 	if !existed {
-		fmt.Printf("%q was not a member of %q (nothing to leave)\n", n, r)
+		fmt.Printf("session %s was not a member of %q (nothing to leave)\n", id.sessionID, id.room)
 		return nil
 	}
 	if *purge {
-		fmt.Printf("left room %q as %q and purged %d message(s)\n", r, n, purged)
+		fmt.Printf("left room %q and purged %d message(s)\n", id.room, purged)
 	} else {
-		fmt.Printf("left room %q as %q (inbox kept)\n", r, n)
+		fmt.Printf("left room %q (inbox kept)\n", id.room)
 	}
 	return nil
 }
@@ -288,7 +582,7 @@ func cmdMembers(args []string) error {
 	room := fs.String("room", "", "room (or $LOREWIRE_ROOM)")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
-	r := resolveRoom(*room)
+	r := resolveRoomFlag(*room)
 	st, err := openStore()
 	if err != nil {
 		return err
@@ -307,39 +601,64 @@ func cmdMembers(args []string) error {
 	}
 	fmt.Printf("room %q:\n", r)
 	for _, m := range members {
-		flag := ""
+		flagStr := ""
 		if m.Role == roleGuest {
-			flag = "   ← needs a role (lorewire role set " + m.Name + " <role>)"
+			flagStr = "   ← needs a role"
 		}
-		fmt.Printf("  %-16s  %s%s\n", m.Name, m.Role, flag)
+		fmt.Printf("  %-18s  %-8s  (%s)%s\n", m.SessionID, m.Role, m.Username, flagStr)
 	}
 	return nil
 }
 
 func cmdRole(args []string) error {
-	// Usage: lorewire role set NAME ROLE [--room ROOM]
 	if len(args) < 3 || args[0] != "set" {
-		return fmt.Errorf("usage: lorewire role set NAME ROLE [--room ROOM]")
+		return fmt.Errorf("usage: lorewire role set NAME|SESSION ROLE [--room ROOM]")
 	}
 	target, role := args[1], args[2]
 	fs := flag.NewFlagSet("role", flag.ExitOnError)
 	room := fs.String("room", "", "room (or $LOREWIRE_ROOM)")
 	fs.Parse(args[3:])
-	r := resolveRoom(*room)
+	r := resolveRoomFlag(*room)
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	existed, err := st.RoleSet(r, target, role)
+	// target may be a session id (contains ~) or a username; for a username,
+	// set the role on all that user's sessions in the room.
+	sessions, err := targetSessions(st, r, target)
 	if err != nil {
 		return err
 	}
-	if !existed {
-		return fmt.Errorf("%q is not a member of room %q", target, r)
+	if len(sessions) == 0 {
+		return fmt.Errorf("no member %q in room %q", target, r)
 	}
-	fmt.Printf("set %q role to %q in room %q\n", target, role, r)
+	for _, sid := range sessions {
+		if _, err := st.RoleSet(r, sid, role); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("set role %q for %d session(s) of %q in room %q\n", role, len(sessions), target, r)
 	return nil
+}
+
+// targetSessions maps a role-set target (session id or username) to session ids
+// that are members of the room.
+func targetSessions(st *Store, room, target string) ([]string, error) {
+	if strings.Contains(target, "~") {
+		return []string{target}, nil
+	}
+	members, err := st.Members(room)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, m := range members {
+		if m.Username == target {
+			out = append(out, m.SessionID)
+		}
+	}
+	return out, nil
 }
 
 func cmdSessions(args []string) error {
@@ -362,25 +681,38 @@ func cmdSessions(args []string) error {
 		fmt.Println("(no sessions registered)")
 		return nil
 	}
+	// Group by user for a readable tree.
+	var lastUser string
 	for _, s := range sess {
-		fmt.Printf("%-16s  last seen %s\n", s.Name, humanAgo(s.LastSeen))
+		if s.Username != lastUser {
+			fmt.Printf("%s (%s)\n", s.Username, s.OwnerID)
+			lastUser = s.Username
+		}
+		loc := s.CWD
+		if loc == "" {
+			loc = "?"
+		}
+		ttyStr := s.TTY
+		if ttyStr == "" {
+			ttyStr = "?"
+		}
+		fmt.Printf("  %-18s  %s  %s  %s  seen %s\n", s.ID, loc, ttyStr, s.Client, humanAgo(s.LastSeen))
 	}
 	return nil
 }
 
+// ── Messaging ───────────────────────────────────────────────────────────────
+
 func cmdSend(args []string) error {
 	fs := flag.NewFlagSet("send", flag.ExitOnError)
-	from := fs.String("from", "", "sender name")
-	to := fs.String("to", "", "recipient: NAME, @ROLE, or 'all'")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("from", "", "sender username override")
+	to := fs.String("to", "", "recipient: NAME, @ROLE, 'all', or a session id")
 	room := fs.String("room", "", "room (or $LOREWIRE_ROOM)")
 	msg := fs.String("msg", "", "message body (or pass positionally)")
 	fs.Parse(args)
-	f, err := resolveName(*from)
-	if err != nil {
-		return err
-	}
 	if *to == "" {
-		return fmt.Errorf("--to is required (NAME, @ROLE, or 'all')")
+		return fmt.Errorf("--to is required (NAME, @ROLE, 'all', or a session id)")
 	}
 	body := *msg
 	if body == "" {
@@ -389,31 +721,31 @@ func cmdSend(args []string) error {
 	if body == "" {
 		return fmt.Errorf("empty message")
 	}
-	r := resolveRoom(*room)
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	recipients, err := st.Send(r, f, *to, body, msgKind, nil)
+	id, err := ctx(st, *fUser, *fName, *room, "", false)
 	if err != nil {
 		return err
 	}
-	warnOrReport(recipients, r, *to)
+	recipients, err := st.Send(id.room, id.sessionID, *to, body, msgKind, nil)
+	if err != nil {
+		return err
+	}
+	warnOrReport(recipients, id.room, *to)
 	return nil
 }
 
 func cmdRequest(args []string) error {
 	fs := flag.NewFlagSet("request", flag.ExitOnError)
-	from := fs.String("from", "", "requester name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("from", "", "requester username override")
 	to := fs.String("to", "", "who to ask: @ROLE or NAME")
 	room := fs.String("room", "", "room (or $LOREWIRE_ROOM)")
 	msg := fs.String("msg", "", "what you need (or pass positionally)")
 	fs.Parse(args)
-	f, err := resolveName(*from)
-	if err != nil {
-		return err
-	}
 	if *to == "" {
 		return fmt.Errorf("--to is required (@ROLE or NAME to ask)")
 	}
@@ -424,71 +756,71 @@ func cmdRequest(args []string) error {
 	if body == "" {
 		return fmt.Errorf("empty request")
 	}
-	r := resolveRoom(*room)
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	recipients, err := st.Send(r, f, *to, body, requestKind, nil)
+	id, err := ctx(st, *fUser, *fName, *room, "", false)
+	if err != nil {
+		return err
+	}
+	recipients, err := st.Send(id.room, id.sessionID, *to, body, requestKind, nil)
 	if err != nil {
 		return err
 	}
 	if len(recipients) == 0 {
-		fmt.Fprintf(os.Stderr, "WARN: no recipient for %q in room %q — nobody to ask\n", *to, r)
+		fmt.Fprintf(os.Stderr, "WARN: no recipient for %q in room %q — nobody to ask\n", *to, id.room)
 		return nil
 	}
-	fmt.Printf("requested from %s in room %q — they'll see it as [request#ID]; they answer with `lorewire grant ID --secret ...`\n", strings.Join(recipients, ", "), r)
+	fmt.Printf("requested from %s in room %q — they answer with `lorewire grant ID --secret ...`\n",
+		strings.Join(recipients, ", "), id.room)
 	return nil
 }
 
 func cmdGrant(args []string) error {
-	// The request id is the leading positional arg; Go's flag parser stops at
-	// the first non-flag token, so pull the id off before parsing flags.
-	id, rest, err := parseIDArg(args)
+	reqID, rest, err := parseIDArg(args)
 	if err != nil {
 		return err
 	}
 	fs := flag.NewFlagSet("grant", flag.ExitOnError)
-	from := fs.String("from", "", "granter name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("from", "", "granter username override")
 	secret := fs.String("secret", "", "the secret value to deliver (consume-once)")
 	fs.Parse(rest)
-	f, err := resolveName(*from)
-	if err != nil {
-		return err
-	}
 	val := *secret
 	if val == "" {
 		val = strings.TrimSpace(strings.Join(fs.Args(), " "))
 	}
 	if val == "" {
-		return fmt.Errorf("provide the secret via --secret VALUE (or positionally after the id)")
+		return fmt.Errorf("provide the secret via --secret VALUE")
 	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	requester, room, err := st.Grant(id, f, val)
+	id, err := ctx(st, *fUser, *fName, "", "", false)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("granted request #%d — secret delivered to %q in room %q (consume-once)\n", id, requester, room)
+	requester, room, err := st.Grant(reqID, id.sessionID, val)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("granted request #%d — secret delivered to %s in room %q (consume-once)\n", reqID, requester, room)
 	return nil
 }
 
 func cmdDeny(args []string) error {
-	id, rest, err := parseIDArg(args)
+	reqID, rest, err := parseIDArg(args)
 	if err != nil {
 		return err
 	}
 	fs := flag.NewFlagSet("deny", flag.ExitOnError)
-	from := fs.String("from", "", "granter name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("from", "", "granter username override")
 	fs.Parse(rest)
-	f, err := resolveName(*from)
-	if err != nil {
-		return err
-	}
 	reason := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if reason == "" {
 		reason = "(no reason given)"
@@ -498,16 +830,18 @@ func cmdDeny(args []string) error {
 		return err
 	}
 	defer st.Close()
-	requester, room, err := st.Deny(id, f, reason)
+	id, err := ctx(st, *fUser, *fName, "", "", false)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("denied request #%d — %q notified in room %q\n", id, requester, room)
+	requester, room, err := st.Deny(reqID, id.sessionID, reason)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("denied request #%d — %s notified in room %q\n", reqID, requester, room)
 	return nil
 }
 
-// parseIDArg pulls a leading numeric request id off the positional args and
-// returns the rest (used by grant/deny where the id comes before the payload).
 func parseIDArg(args []string) (int64, []string, error) {
 	if len(args) == 0 {
 		return 0, nil, fmt.Errorf("missing request id (e.g. `lorewire grant 12 --secret ...`)")
@@ -521,21 +855,21 @@ func parseIDArg(args []string) (int64, []string, error) {
 
 func cmdRecv(args []string) error {
 	fs := flag.NewFlagSet("recv", flag.ExitOnError)
-	name := fs.String("name", "", "your session name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override")
 	room := fs.String("room", "", "limit to one room (default: all your rooms)")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
-	n, err := resolveName(*name)
-	if err != nil {
-		return err
-	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	// Empty room string means "all rooms"; --room narrows it.
-	msgs, err := st.Recv(n, *room)
+	id, err := ctx(st, *fUser, *fName, "", "", false)
+	if err != nil {
+		return err
+	}
+	msgs, err := st.Recv(id.sessionID, *room)
 	if err != nil {
 		return err
 	}
@@ -548,21 +882,22 @@ func cmdRecv(args []string) error {
 
 func cmdInbox(args []string) error {
 	fs := flag.NewFlagSet("inbox", flag.ExitOnError)
-	name := fs.String("name", "", "your session name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override")
 	room := fs.String("room", "", "limit to one room (default: all your rooms)")
 	all := fs.Bool("all", false, "include already-read messages")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
-	n, err := resolveName(*name)
-	if err != nil {
-		return err
-	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
-	msgs, err := st.Inbox(n, *room, *all)
+	id, err := ctx(st, *fUser, *fName, "", "", false)
+	if err != nil {
+		return err
+	}
+	msgs, err := st.Inbox(id.sessionID, *room, *all)
 	if err != nil {
 		return err
 	}
@@ -575,27 +910,28 @@ func cmdInbox(args []string) error {
 
 func cmdWatch(args []string) error {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
-	name := fs.String("name", "", "your session name")
+	fUser := fs.String("user", "", "userId override")
+	fName := fs.String("name", "", "username override")
 	room := fs.String("room", "", "limit to one room (default: all your rooms)")
 	interval := fs.Duration("interval", 2*time.Second, "poll interval")
 	asJSON := fs.Bool("json", false, "output JSON per message")
 	fs.Parse(args)
-	n, err := resolveName(*name)
-	if err != nil {
-		return err
-	}
 	st, err := openStore()
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	id, err := ctx(st, *fUser, *fName, "", "", true)
+	if err != nil {
+		return err
+	}
 	scope := "all rooms"
 	if *room != "" {
 		scope = "room " + *room
 	}
-	fmt.Fprintf(os.Stderr, "watching %s for %q every %s (Ctrl-C to stop)\n", scope, n, *interval)
+	fmt.Fprintf(os.Stderr, "watching %s for %s every %s (Ctrl-C to stop)\n", scope, id.sessionID, *interval)
 	for {
-		msgs, err := st.Recv(n, *room)
+		msgs, err := st.Recv(id.sessionID, *room)
 		if err != nil {
 			return err
 		}
@@ -610,8 +946,23 @@ func cmdWatch(args []string) error {
 	}
 }
 
-// warnOrReport prints delivery results, warning loudly on an empty fan-out so a
-// broadcast/@role to nobody doesn't masquerade as success.
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+// resolveRoomFlag resolves a room for read-only commands (no identity needed):
+// flag > $LOREWIRE_ROOM > .lorewire.jsonc > default.
+func resolveRoomFlag(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if env := os.Getenv("LOREWIRE_ROOM"); env != "" {
+		return env
+	}
+	if cfg, err := loadConfig(); err == nil && cfg.Room != "" {
+		return cfg.Room
+	}
+	return defaultRoom
+}
+
 func warnOrReport(recipients []string, room, to string) {
 	if len(recipients) == 0 {
 		fmt.Fprintf(os.Stderr, "WARN: no recipients for %q in room %q — message delivered to nobody\n", to, room)
@@ -630,12 +981,6 @@ func printMessages(msgs []Message, emptyMsg string) {
 	}
 }
 
-// formatMessage renders one message as:
-//
-//	[15:04] room/alice → bob: body
-//
-// with a [kind#id] tag for non-plain messages (request/grant/deny) and a
-// (read) suffix for already-consumed rows shown by inbox.
 func formatMessage(m Message) string {
 	tag := ""
 	switch m.Kind {
@@ -662,7 +1007,6 @@ func printJSON(v any) error {
 	return enc.Encode(v)
 }
 
-// humanAgo renders a coarse "how long ago" for the sessions list.
 func humanAgo(t time.Time) string {
 	d := time.Since(t)
 	switch {
