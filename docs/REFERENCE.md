@@ -208,13 +208,28 @@ cd ~/work/other-project
 lorewire init --username bob --room other --role dev
 ```
 
+#### `lorewire import`
+
+```
+lorewire import [NAME]
+```
+
+Re-creates the identity described by the current directory's `.lorewire.jsonc` in this machine's database — the fresh-machine / post-wipe path. Reads the `userId` (and `username` hint) from the config and registers it if the DB doesn't already have it. Idempotent: a no-op if the identity already exists. `NAME` is optional and only needed if the config predates the `username` field.
+
+```bash
+# on a new machine after cloning a repo whose .lorewire.jsonc has a userId:
+lorewire import
+#   imported "bob" (usr_k3n9x2p) from .../.lorewire.jsonc — ready to use here
+lorewire import            # again → "already imported: usr_k3n9x2p is "bob""
+```
+
 #### `lorewire whoami`
 
 ```
 lorewire whoami [--json]
 ```
 
-Prints the effective identity/session/room/role for the current directory and environment, and the **source** of each value (flag / env / config / default). The go-to command for "why am I in the wrong room?".
+Prints the effective identity/session/room/role for the current directory and environment, the **source** of each value (flag / env / config / default), and — once this terminal has registered — the current session's full stored detail (cwd, tty, pid, host, client, timestamps) and the rooms it belongs to. The go-to command for "who am I, and what is this terminal's session?".
 
 ```bash
 lorewire whoami
@@ -224,7 +239,31 @@ lorewire whoami
 #   room     : project-x (config)
 #   role     : cto (config)
 #   config   : /abs/path/.lorewire.jsonc
+#
+#   session (this terminal):
+#     cwd      : /Users/bob/project-x
+#     tty      : /dev/ttys004
+#     pid      : 90382
+#     host     : mbp.local
+#     client   : claude-code
+#     started  : 14:02:11
+#     last seen: just now
+#     member of: project-x (cto), ops (lead)
 ```
+
+`--json` returns everything in one object — resolved identity, `sources`, `sessionDetail` (the full session row, `null` until registered), `memberships`, and `config`:
+
+```bash
+lorewire whoami --json
+# { "userId": "...", "username": "...", "session": "bob~a1f", "registered": true,
+#   "room": "...", "role": "...", "config": "...",
+#   "sources": { "identity": "config", "room": "config", "role": "config" },
+#   "sessionDetail": { "ID": "bob~a1f", "CWD": "...", "TTY": "...", "PID": 90382,
+#                      "Host": "...", "Client": "claude-code", "CreatedAt": "...", "LastSeen": "..." },
+#   "memberships": [ { "Room": "project-x", "Role": "cto", ... } ] }
+```
+
+Every listing/read command also supports `--json` for scripting: `whoami`, `sessions`, `rooms`, `members`, `user list`, `recv`, `inbox`, `watch`.
 
 ### Presence & rooms commands
 
@@ -294,18 +333,43 @@ Removes sessions whose last activity predates the cutoff (a janitor for crashed 
 lorewire prune --older-than 1h
 ```
 
+#### `lorewire reset`
+
+```
+lorewire reset sessions [--user NAME | --me] [--yes]
+lorewire reset messages [--yes]
+lorewire reset all [--yes]
+```
+
+Deletes data, with a **preview-then-confirm** gate: without `--yes` it only prints what *would* be deleted and the exact confirming command; with `--yes` it deletes and reports counts.
+
+| Scope | Deletes | Keeps |
+|---|---|---|
+| `sessions` | all sessions + memberships | users, rooms, messages |
+| `sessions --user NAME` | just that user's sessions | everyone/everything else |
+| `sessions --me` | just your sessions (current folder's identity) | everyone/everything else |
+| `messages` | all messages | users, rooms, sessions |
+| `all` | everything (users, rooms, sessions, messages) | — (re-seeds the default room) |
+
+```bash
+lorewire reset sessions --user bob        # preview: "would delete: 2 session(s) belonging to bob…"
+lorewire reset sessions --user bob --yes  # "deleted 2 session(s) of bob"
+lorewire reset all --yes                  # full wipe (then `lorewire import` to restore identities)
+```
+
 #### `lorewire rooms`
 
 ```
-lorewire rooms [--json]
+lorewire rooms [--me] [--json]
 ```
 
-Lists rooms with member counts and owner.
+Lists rooms with member counts and owner. `--me` limits to rooms your current identity is a member of (member counts still reflect the whole room).
 
 ```bash
 lorewire rooms
 #   main        1 member(s)  owner (system)
 #   project-x   4 member(s)  owner bob
+lorewire rooms --me        # only rooms you're in
 ```
 
 #### `lorewire members`
@@ -340,10 +404,10 @@ lorewire role set carol~9c2 lead --room project-x
 #### `lorewire sessions`
 
 ```
-lorewire sessions [--json]
+lorewire sessions [--me] [--json]
 ```
 
-Lists live sessions grouped by user, with cwd, tty, client, and last-seen.
+Lists live sessions grouped by user, with cwd (and git branch inline), client, and last-seen. `--me` limits to your own sessions. `--json` includes the full per-session detail: `TTY`, `PID`, `Host`, `OSUser`, `OS`/`Arch`/`Shell`, `TermProgram`, `SSH`/`Tmux`, `GitBranch`/`GitRepo`, `Version`, and `IDSource` (where the session id was derived — `agent:VAR` / `tty` / `ppid` / `env:VAR`).
 
 ```bash
 lorewire sessions
@@ -487,7 +551,9 @@ Single SQLite file at `$LOREWIRE_DB` (default `~/.lorewire/lorewire.db`), WAL jo
 ```sql
 users(user_id PK, username UNIQUE, created_at)
 rooms(name PK, owner_id, created_at)
-sessions(session_id PK, owner_id, cwd, tty, pid, host, client, meta, created_at, last_seen)
+sessions(session_id PK, owner_id, cwd, tty, pid, host, client,
+         os_user, os, arch, shell, term_program, ssh, tmux, git_branch, git_repo, version, id_source,
+         meta, created_at, last_seen)
 members(room, session_id, owner_id, role, joined_at, PRIMARY KEY(room, session_id))
 messages(id PK, room, from_id, to_id, kind, body, ref_id, created_at, read_at)
 ```

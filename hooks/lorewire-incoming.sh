@@ -38,6 +38,9 @@ out="$("$LW" recv 2>/dev/null || true)"
 # Identity may come from .lorewire.jsonc rather than $LOREWIRE_NAME, so derive
 # the display name from whoami instead of assuming the env var is set.
 who="$("$LW" whoami 2>/dev/null | awk '/^username/{print $3; exit}')"
+# Extract the distinct sender usernames (the part before "~" in each line's
+# "room/<sender>~hash → ..." field) so the reply target is explicit.
+senders="$(printf '%s\n' "$out" | sed -nE 's#.*/([^~ ]+)~[^ ]+ →.*#\1#p' | sort -u | paste -sd', ' -)"
 echo "📨 Messages for ${who:-this session} from other lorewire sessions:"
 echo "$out"
-echo "(Reply with: lorewire send --to <name|@role> \"...\")"
+echo "(Reply with: lorewire send --to <name|@role> \"...\"${senders:+  — senders: $senders})"

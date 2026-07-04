@@ -212,7 +212,8 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 | `lorewire user list [--json]` | List users and their session counts. |
 | `lorewire user rename OLD NEW` | Rename a username (userId unchanged; cascades to live session handles). |
 | `lorewire init --username NAME \| --user usr_…` | Point this dir's `.lorewire.jsonc` at an existing identity. |
-| `lorewire whoami [--json]` | Show effective userId/username/session/room/role — and the source of each. |
+| `lorewire import [NAME]` | Re-create this dir's `.lorewire.jsonc` identity in the DB (fresh machine / after a wipe). Idempotent. |
+| `lorewire whoami [--json]` | Show effective identity/room/role + this terminal's full session detail (cwd, git branch, tty, `id from`, …) and the source of each value. |
 
 **Presence & rooms**
 
@@ -223,10 +224,12 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 | `lorewire leave [--room ROOM] [--purge]` | Leave one room. `--purge` also deletes that room's inbox for you. |
 | `lorewire leave --all [--purge]` | Unregister from **every** room and remove the session (what the `SessionEnd` hook runs). |
 | `lorewire prune [--older-than 30m]` | Janitor: remove sessions idle past the cutoff (and their memberships). Messages left intact. |
-| `lorewire rooms [--json]` | List rooms with member counts and owner. |
+| `lorewire reset sessions [--user NAME\|--me] [--yes]` | Delete sessions — all, or just one user's / your own. Previews first; `--yes` to apply. |
+| `lorewire reset messages\|all [--yes]` | Delete all messages, or wipe everything (users, rooms, sessions, messages). |
+| `lorewire rooms [--me] [--json]` | List rooms (all, or `--me` = only the ones you're in) with member counts and owner. |
 | `lorewire members [--room ROOM] [--json]` | List a room's members and their roles. |
-| `lorewire role set NAME ROLE [--room ROOM]` | Change a member's role. |
-| `lorewire sessions [--json]` | List all live sessions and last-seen times. |
+| `lorewire role set NAME\|SESSION ROLE [--room ROOM]` | Change a member's role (a username updates all their sessions in the room). |
+| `lorewire sessions [--me] [--json]` | List live sessions (all, or `--me` = just yours), grouped by user, with cwd/branch/client/last-seen. |
 
 **Messaging** (room resolves: `--room` flag → `$LOREWIRE_ROOM` → `main`)
 
@@ -245,7 +248,7 @@ Secret payloads are **hard-deleted after a single `recv`**, so keys don't linger
 | `lorewire grant ID --secret VALUE` | Answer a request with a secret, delivered **consume-once** (hard-deleted after one `recv`). |
 | `lorewire deny ID REASON` | Decline a request; the requester is notified. |
 
-Identity resolves as: `--user`/`--name` flag → `$LOREWIRE_USER_ID`/`$LOREWIRE_NAME` env → `.lorewire.jsonc` userId. Room resolves: `--room` → `$LOREWIRE_ROOM` → `.lorewire.jsonc` room → `main`. Role likewise via `$LOREWIRE_ROLE` / config → `guest`. Put them in a `.lorewire.jsonc` (see [Identity & config](#identity--config)) and drop the flags entirely.
+Commands are **global** (work from any directory — `sessions`, `rooms`, `members`, `user list`, `prune`, `reset`) or **session** (act as you, using the current folder's identity). Identity resolves as: `--user`/`--name` flag → `$LOREWIRE_USER_ID`/`$LOREWIRE_NAME` env → `.lorewire.jsonc` userId. Room: `--room` → `$LOREWIRE_ROOM` → config → `main`. Role likewise via `$LOREWIRE_ROLE` / config → `guest`. Your **session id** is derived per terminal/agent — see [How sessions work](docs/SESSIONS.md). Put identity/room/role in a `.lorewire.jsonc` (see [Identity & config](#identity--config)) and drop the flags entirely.
 
 For every flag, environment variable, addressing form, schema table, exit code, and more examples, see the **[complete reference manual](docs/REFERENCE.md)**.
 
@@ -391,9 +394,16 @@ task reset          # delete the default database
 
 ## Documentation
 
+Full knowledge base in **[docs/](docs/README.md)**:
+
 - **[Tutorial](docs/TUTORIAL.md)** — hands-on: two Claude Code sessions talking to each other, from zero to secrets, step by step.
-- **[Complete reference manual](docs/REFERENCE.md)** — every command, flag, environment variable, config key, addressing form, hook, schema table, exit code, and recipe.
-- [PLAN.md](PLAN.md) — design decisions and rationale for the identity/config layer.
+- **[Use cases cookbook](docs/USE-CASES.md)** — 11 real scenarios worked start-to-finish with exact commands (team + roles, task hand-off, secrets, orchestrator↔workers, multi-room, CI, and more).
+- **[How sessions work](docs/SESSIONS.md)** — plain-language explainer of session-id resolution (agents vs terminals), with use cases and examples.
+- **[Architecture](docs/ARCHITECTURE.md)** — internal design, full schema, and every decision + its rationale (for maintainers/agents).
+- **[Integrations](docs/INTEGRATIONS.md)** — wiring lorewire into Claude Code and any other agent (Codex, opencode, scripts), plus troubleshooting.
+- **[Reference](docs/REFERENCE.md)** — every command, flag, environment variable, config key, addressing form, hook, schema table, exit code, and recipe.
+- **[Glossary](docs/GLOSSARY.md)** — one-line definitions of every term.
+- [PLAN.md](PLAN.md) — design/decision log for the identity/config layer.
 - `hooks/settings.example.json` — ready-to-merge Claude Code hook config.
 
 ## The lore family

@@ -45,16 +45,28 @@ type User struct {
 
 // Session is one open terminal, owned by a user. session_id is username~<tty>.
 type Session struct {
-	ID        string
-	OwnerID   string
-	Username  string // resolved from users at read time
-	CWD       string
-	TTY       string
-	PID       int
-	Host      string
-	Client    string
-	CreatedAt time.Time
-	LastSeen  time.Time
+	ID       string
+	OwnerID  string
+	Username string // resolved from users at read time
+	// Terminal / process context, captured at register (and refreshed on use):
+	CWD         string
+	TTY         string
+	PID         int    // parent shell pid
+	Host        string // hostname
+	Client      string // claude-code | shell | … (best-effort)
+	OSUser      string // OS login that owns the terminal
+	OS          string // runtime.GOOS
+	Arch        string // runtime.GOARCH
+	Shell       string // basename of $SHELL
+	TermProgram string // $TERM_PROGRAM (iTerm.app, vscode, Apple_Terminal, …)
+	SSH         bool   // running over SSH ($SSH_CONNECTION/$SSH_TTY)
+	Tmux        bool   // inside tmux ($TMUX)
+	GitBranch   string // current branch of the cwd repo (if any)
+	GitRepo     string // basename of the cwd repo root (if any)
+	Version     string // lorewire binary version
+	IDSource    string // where the session id was derived from (agent:VAR / tty / ppid / env:VAR)
+	CreatedAt   time.Time
+	LastSeen    time.Time
 }
 
 // Member is a session's membership of one room, with its role there. owner_id is
@@ -225,16 +237,27 @@ CREATE TABLE IF NOT EXISTS rooms (
 	created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
-	session_id TEXT PRIMARY KEY,
-	owner_id   TEXT NOT NULL,
-	cwd        TEXT,
-	tty        TEXT,
-	pid        INTEGER,
-	host       TEXT,
-	client     TEXT,
-	meta       TEXT,
-	created_at TEXT NOT NULL,
-	last_seen  TEXT NOT NULL
+	session_id   TEXT PRIMARY KEY,
+	owner_id     TEXT NOT NULL,
+	cwd          TEXT,
+	tty          TEXT,
+	pid          INTEGER,
+	host         TEXT,
+	client       TEXT,
+	os_user      TEXT,
+	os           TEXT,
+	arch         TEXT,
+	shell        TEXT,
+	term_program TEXT,
+	ssh          INTEGER,
+	tmux         INTEGER,
+	git_branch   TEXT,
+	git_repo     TEXT,
+	version      TEXT,
+	id_source    TEXT,
+	meta         TEXT,
+	created_at   TEXT NOT NULL,
+	last_seen    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS members (
 	room       TEXT NOT NULL,
@@ -262,10 +285,58 @@ CREATE INDEX IF NOT EXISTS idx_sessions_owner ON sessions(owner_id);
 	if err != nil {
 		return err
 	}
+	// Additive migration: add newer session-context columns to an existing DB
+	// only if missing (SQLite ALTER ADD COLUMN is safe/cheap), so upgrading keeps
+	// data. Fresh DBs already have them from the CREATE above.
+	for col, decl := range map[string]string{
+		"os_user":      "os_user TEXT",
+		"os":           "os TEXT",
+		"arch":         "arch TEXT",
+		"shell":        "shell TEXT",
+		"term_program": "term_program TEXT",
+		"ssh":          "ssh INTEGER",
+		"tmux":         "tmux INTEGER",
+		"git_branch":   "git_branch TEXT",
+		"git_repo":     "git_repo TEXT",
+		"version":      "version TEXT",
+		"id_source":    "id_source TEXT",
+	} {
+		ok, err := s.columnExists("sessions", col)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err := s.db.Exec("ALTER TABLE sessions ADD COLUMN " + decl); err != nil {
+				return err
+			}
+		}
+	}
 	now := time.Now().UTC().Format(timeFmt)
 	_, err = s.db.Exec(
 		`INSERT OR IGNORE INTO rooms (name, owner_id, created_at) VALUES (?, '', ?)`, defaultRoom, now)
 	return err
+}
+
+// columnExists reports whether a table already has a column (for additive
+// migrations that must not re-add an existing column).
+func (s *Store) columnExists(table, col string) (bool, error) {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -427,9 +498,15 @@ GROUP BY u.user_id, u.username, u.created_at ORDER BY u.username`)
 func (s *Store) RegisterSession(sess Session) error {
 	now := time.Now().UTC().Format(timeFmt)
 	return withRetry(func() error {
+		// On conflict we keep any non-empty prior value for the subprocess-
+		// derived columns (tty, git_*), because light commands (send/recv) don't
+		// capture those and would otherwise wipe what `register` recorded. The
+		// cheap always-captured columns just overwrite with the fresh value.
 		_, err := s.db.Exec(`
-INSERT INTO sessions (session_id, owner_id, cwd, tty, pid, host, client, created_at, last_seen)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO sessions (session_id, owner_id, cwd, tty, pid, host, client,
+  os_user, os, arch, shell, term_program, ssh, tmux, git_branch, git_repo, version, id_source,
+  created_at, last_seen)
+VALUES (?, ?, ?, ?, ?, ?, ?,  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,  ?, ?)
 ON CONFLICT(session_id) DO UPDATE SET
   owner_id=excluded.owner_id,
   cwd=COALESCE(NULLIF(excluded.cwd,''), sessions.cwd),
@@ -437,10 +514,60 @@ ON CONFLICT(session_id) DO UPDATE SET
   pid=CASE WHEN excluded.pid>0 THEN excluded.pid ELSE sessions.pid END,
   host=COALESCE(NULLIF(excluded.host,''), sessions.host),
   client=COALESCE(NULLIF(excluded.client,''), sessions.client),
+  os_user=COALESCE(NULLIF(excluded.os_user,''), sessions.os_user),
+  os=COALESCE(NULLIF(excluded.os,''), sessions.os),
+  arch=COALESCE(NULLIF(excluded.arch,''), sessions.arch),
+  shell=COALESCE(NULLIF(excluded.shell,''), sessions.shell),
+  term_program=COALESCE(NULLIF(excluded.term_program,''), sessions.term_program),
+  ssh=excluded.ssh,
+  tmux=excluded.tmux,
+  git_branch=COALESCE(NULLIF(excluded.git_branch,''), sessions.git_branch),
+  git_repo=COALESCE(NULLIF(excluded.git_repo,''), sessions.git_repo),
+  version=COALESCE(NULLIF(excluded.version,''), sessions.version),
+  id_source=COALESCE(NULLIF(excluded.id_source,''), sessions.id_source),
   last_seen=excluded.last_seen`,
-			sess.ID, sess.OwnerID, sess.CWD, sess.TTY, sess.PID, sess.Host, sess.Client, now, now)
+			sess.ID, sess.OwnerID, sess.CWD, sess.TTY, sess.PID, sess.Host, sess.Client,
+			sess.OSUser, sess.OS, sess.Arch, sess.Shell, sess.TermProgram, boolToInt(sess.SSH), boolToInt(sess.Tmux),
+			sess.GitBranch, sess.GitRepo, sess.Version, sess.IDSource, now, now)
 		return err
 	})
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// sessionSelectCols is the column list (with the users join alias) shared by
+// SessionByID and Sessions, so the SELECT and the scanner never drift.
+const sessionSelectCols = `se.session_id, se.owner_id, u.username, se.cwd, se.tty, se.pid, se.host, se.client,
+  se.os_user, se.os, se.arch, se.shell, se.term_program, se.ssh, se.tmux, se.git_branch, se.git_repo, se.version, se.id_source,
+  se.created_at, se.last_seen`
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanSession reads one sessions+users row (selected via sessionSelectCols).
+func scanSession(sc rowScanner) (Session, error) {
+	var se Session
+	var cwd, tty, host, client, osu, oss, arch, shell, tp, gb, gr, ver, idsrc sql.NullString
+	var pid, ssh, tmux sql.NullInt64
+	var created, seen string
+	if err := sc.Scan(&se.ID, &se.OwnerID, &se.Username, &cwd, &tty, &pid, &host, &client,
+		&osu, &oss, &arch, &shell, &tp, &ssh, &tmux, &gb, &gr, &ver, &idsrc, &created, &seen); err != nil {
+		return se, err
+	}
+	se.CWD, se.TTY, se.Host, se.Client = cwd.String, tty.String, host.String, client.String
+	se.OSUser, se.OS, se.Arch, se.Shell, se.TermProgram = osu.String, oss.String, arch.String, shell.String, tp.String
+	se.GitBranch, se.GitRepo, se.Version, se.IDSource = gb.String, gr.String, ver.String, idsrc.String
+	se.PID = int(pid.Int64)
+	se.SSH = ssh.Int64 != 0
+	se.Tmux = tmux.Int64 != 0
+	se.CreatedAt, _ = time.Parse(timeFmt, created)
+	se.LastSeen, _ = time.Parse(timeFmt, seen)
+	return se, nil
 }
 
 // Touch refreshes last_seen for a session (heartbeat on send/recv).
@@ -449,28 +576,70 @@ func (s *Store) Touch(sessionID string) {
 	s.db.Exec(`UPDATE sessions SET last_seen = ? WHERE session_id = ?`, now, sessionID)
 }
 
-func (s *Store) Sessions() ([]Session, error) {
-	rows, err := s.db.Query(`
-SELECT se.session_id, se.owner_id, u.username, se.cwd, se.tty, se.pid, se.host, se.client, se.created_at, se.last_seen
+// SessionByID returns one session's stored row (with its owner username), or
+// ok=false if this terminal hasn't registered a session yet. Used by `whoami`
+// to show the current terminal's full detail.
+func (s *Store) SessionByID(id string) (*Session, bool, error) {
+	row := s.db.QueryRow(
+		`SELECT `+sessionSelectCols+`
 FROM sessions se JOIN users u ON u.user_id = se.owner_id
-ORDER BY u.username, se.created_at`)
+WHERE se.session_id = ?`, id)
+	se, err := scanSession(row)
+	if err == sql.ErrNoRows {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return &se, true, nil
+}
+
+// MembershipsForSession returns every room this session belongs to, with its
+// role in each — the "member of" view for `whoami`.
+func (s *Store) MembershipsForSession(sessionID string) ([]Member, error) {
+	rows, err := s.db.Query(`
+SELECT m.room, m.session_id, m.owner_id, u.username, m.role, m.joined_at
+FROM members m JOIN users u ON u.user_id = m.owner_id
+WHERE m.session_id = ? ORDER BY m.room`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Member
+	for rows.Next() {
+		var m Member
+		var joined string
+		if err := rows.Scan(&m.Room, &m.SessionID, &m.OwnerID, &m.Username, &m.Role, &joined); err != nil {
+			return nil, err
+		}
+		m.JoinedAt, _ = time.Parse(timeFmt, joined)
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// Sessions lists live sessions. ownerID "" returns every session (the global
+// view); a non-empty ownerID scopes to one user's sessions (the `--me` view).
+func (s *Store) Sessions(ownerID string) ([]Session, error) {
+	q := `SELECT ` + sessionSelectCols + `
+FROM sessions se JOIN users u ON u.user_id = se.owner_id`
+	var args []any
+	if ownerID != "" {
+		q += ` WHERE se.owner_id = ?`
+		args = append(args, ownerID)
+	}
+	q += ` ORDER BY u.username, se.created_at`
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Session
 	for rows.Next() {
-		var se Session
-		var cwd, tty, host, client sql.NullString
-		var pid sql.NullInt64
-		var created, seen string
-		if err := rows.Scan(&se.ID, &se.OwnerID, &se.Username, &cwd, &tty, &pid, &host, &client, &created, &seen); err != nil {
+		se, err := scanSession(rows)
+		if err != nil {
 			return nil, err
 		}
-		se.CWD, se.TTY, se.Host, se.Client = cwd.String, tty.String, host.String, client.String
-		se.PID = int(pid.Int64)
-		se.CreatedAt, _ = time.Parse(timeFmt, created)
-		se.LastSeen, _ = time.Parse(timeFmt, seen)
 		out = append(out, se)
 	}
 	return out, rows.Err()
@@ -652,6 +821,107 @@ func (s *Store) Prune(cutoff time.Time) ([]string, error) {
 	return removed, nil
 }
 
+// Counts returns row counts per table for the `reset` dry-run summary.
+func (s *Store) Counts() (users, sessions, rooms, messages int, err error) {
+	q := func(sql string) int {
+		var n int
+		if err == nil {
+			err = s.db.QueryRow(sql).Scan(&n)
+		}
+		return n
+	}
+	users = q(`SELECT count(*) FROM users`)
+	sessions = q(`SELECT count(*) FROM sessions`)
+	rooms = q(`SELECT count(*) FROM rooms`)
+	messages = q(`SELECT count(*) FROM messages`)
+	return users, sessions, rooms, messages, err
+}
+
+// DeleteAllSessions removes every session and its room memberships (clears all
+// presence) but keeps users, rooms, and messages. Returns the number of
+// sessions deleted.
+func (s *Store) DeleteAllSessions() (int64, error) {
+	var n int64
+	err := withRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`DELETE FROM members`); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM sessions`)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		return tx.Commit()
+	})
+	return n, err
+}
+
+// DeleteSessionsForOwner removes just one user's sessions and their memberships
+// (leaving other users, rooms, and messages untouched). Returns the count.
+func (s *Store) DeleteSessionsForOwner(ownerID string) (int64, error) {
+	var n int64
+	err := withRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`DELETE FROM members WHERE owner_id = ?`, ownerID); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM sessions WHERE owner_id = ?`, ownerID)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		return tx.Commit()
+	})
+	return n, err
+}
+
+// DeleteAllMessages removes every message (inboxes and history) but keeps users,
+// rooms, sessions, and memberships. Returns the number of messages deleted.
+func (s *Store) DeleteAllMessages() (int64, error) {
+	var n int64
+	err := withRetry(func() error {
+		res, err := s.db.Exec(`DELETE FROM messages`)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		return nil
+	})
+	return n, err
+}
+
+// ResetAll wipes every table (users, rooms, sessions, members, messages) and
+// re-seeds the default room — a from-scratch database without deleting the file.
+func (s *Store) ResetAll() error {
+	now := time.Now().UTC().Format(timeFmt)
+	return withRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for _, t := range []string{"messages", "members", "sessions", "rooms", "users"} {
+			if _, err := tx.Exec(`DELETE FROM ` + t); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO rooms (name, owner_id, created_at) VALUES (?, '', ?)`, defaultRoom, now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+}
+
 func (s *Store) RoleSet(room, sessionID, role string) (bool, error) {
 	var existed bool
 	err := withRetry(func() error {
@@ -666,13 +936,22 @@ func (s *Store) RoleSet(room, sessionID, role string) (bool, error) {
 	return existed, err
 }
 
-func (s *Store) Rooms() ([]Room, error) {
-	rows, err := s.db.Query(`
+// Rooms lists rooms with their member counts and owner. ownerID "" returns every
+// room (global view); a non-empty ownerID scopes to rooms that user is a member
+// of (the `--me` view), while member counts still reflect the whole room.
+func (s *Store) Rooms(ownerID string) ([]Room, error) {
+	q := `
 SELECT r.name, r.owner_id, COALESCE(u.username, ''), r.created_at, COUNT(m.session_id)
 FROM rooms r
 LEFT JOIN users u ON u.user_id = r.owner_id
-LEFT JOIN members m ON m.room = r.name
-GROUP BY r.name, r.owner_id, u.username, r.created_at ORDER BY r.name`)
+LEFT JOIN members m ON m.room = r.name`
+	var args []any
+	if ownerID != "" {
+		q += ` WHERE EXISTS (SELECT 1 FROM members mm WHERE mm.room = r.name AND mm.owner_id = ?)`
+		args = append(args, ownerID)
+	}
+	q += ` GROUP BY r.name, r.owner_id, u.username, r.created_at ORDER BY r.name`
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}

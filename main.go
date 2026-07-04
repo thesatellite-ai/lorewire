@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,8 @@ func main() {
 		err = cmdUser(args)
 	case "init":
 		err = cmdInit(args)
+	case "import":
+		err = cmdImport(args)
 	case "whoami":
 		err = cmdWhoami(args)
 	case "register":
@@ -43,6 +46,8 @@ func main() {
 		err = cmdLeave(args)
 	case "prune":
 		err = cmdPrune(args)
+	case "reset":
+		err = cmdReset(args)
 	case "rooms":
 		err = cmdRooms(args)
 	case "members":
@@ -80,39 +85,85 @@ func main() {
 }
 
 func usage() {
-	fmt.Print(`lorewire — message bus for talking between agent/Claude Code sessions
+	fmt.Print(`lorewire — a message bus for talking between agent/Claude Code sessions
 
-Identity & config:
-  lorewire user create NAME [--id usr_…]     claim a username (mint or import a userId); writes .lorewire.jsonc
-  lorewire user list                         list users and their session counts
-  lorewire user rename OLD NEW               rename a username (userId unchanged)
-  lorewire init --username NAME | --user ID  point this dir's .lorewire.jsonc at an existing identity
-  lorewire whoami                            show effective identity/room/role and where each came from
+lorewire lets separate terminal sessions (you, other AI agents, or scripts)
+message each other through a shared local database. If you are an AI agent, this
+is how you coordinate with other sessions: ask questions, hand off work, request
+a secret. Everything below is what you need to use it.
 
-Presence & rooms (room resolves: --room > $LOREWIRE_ROOM > .lorewire.jsonc > "main"):
-  lorewire register [--new]                  register this terminal's session and join the configured room
-  lorewire join --room ROOM [--role ROLE]    join/create a room with a role
-  lorewire leave [--room ROOM] [--purge]     leave one room
-  lorewire leave --all [--purge]             remove this terminal's session from every room
-  lorewire prune [--older-than 30m]          remove sessions not seen since the cutoff
-  lorewire rooms [--json]                    list rooms
-  lorewire members [--room ROOM] [--json]    list a room's members and roles
-  lorewire role set NAME|SESSION ROLE [--room ROOM]   change a member's role
-  lorewire sessions [--json]                 list live sessions grouped by user
+WHAT YOU ARE
+  When you run lorewire you act as a SESSION — this one terminal — owned by a
+  USER (a stable identity: userId + human username, e.g. "bob"). One user can
+  have many sessions (one per terminal). Your identity, default room, and role
+  are read from a .lorewire.jsonc in the current folder (override with env/flags).
+  Run  lorewire whoami  to see exactly who you are, your session id, room, role.
 
-Messaging:
-  lorewire send [--room ROOM] --to NAME|@ROLE|all|SESSION MSG   send a message
-  lorewire recv [--room ROOM] [--json]       read + consume unread messages
-  lorewire inbox [--room ROOM] [--all] [--json]   show messages without consuming
-  lorewire watch [--room ROOM] [--interval 2s]    stream new messages
+HOW MESSAGING WORKS
+  Messages live in a ROOM (default "main"; rooms just scope conversations).
+  You address a message with --to:
+    --to bob        every one of user bob's terminals in the room
+    --to @cto       everyone holding the "cto" role in the room
+    --to all        every member of the room
+    --to bob~a1f    one specific terminal (a session id)
+  To RECEIVE, you must be a member of the room — recv/watch/register do this for
+  you automatically. Read your inbox with:
+    lorewire recv     read AND consume new messages (they're marked read/removed)
+    lorewire inbox    show messages without consuming (--all includes read)
+    lorewire watch    block and stream new messages as they arrive
+  An incoming message prints as  "<room>/<sender>~<hash> → <you>: <text>".
+  To REPLY, take the sender's username (the part before "~") and:
+    lorewire send --to <sender> "your reply"        (or --to @<their-role>)
 
-Requesting secrets:
-  lorewire request [--room ROOM] --to @ROLE|NAME MSG   ask; recipients see [request#ID]
-  lorewire grant ID --secret VALUE           answer a request with a consume-once secret
-  lorewire deny  ID REASON                    decline a request
+COMMANDS  (🌐 GLOBAL = works from ANY directory · 📁 SESSION = acts as you, uses this folder's identity)
 
-Identity resolves from flags, else $LOREWIRE_USER_ID / $LOREWIRE_NAME, else .lorewire.jsonc.
-Database: $LOREWIRE_DB, else ~/.lorewire/lorewire.db
+  SETUP — claim or point an identity (writes ./.lorewire.jsonc):
+    lorewire user create NAME [--id usr_…] [--room R] [--role X]   claim a username; mint/import a userId
+    lorewire init --username NAME | --user usr_…                   point this dir at an existing identity
+    lorewire import [NAME]                                         re-create this dir's .lorewire.jsonc identity in the DB (fresh machine)
+
+  🌐 GLOBAL — inspect/manage everything, from any directory:
+    lorewire sessions [--me] [--json]          list live sessions (all, or --me = just yours)
+    lorewire user list [--json]                list all users + session counts
+    lorewire user rename OLD NEW               rename a username (userId unchanged)
+    lorewire rooms [--me] [--json]             list rooms (all, or --me = only ones you're in)
+    lorewire members [--room ROOM] [--json]    list a room's members and roles
+    lorewire role set NAME|SESSION ROLE [--room ROOM]   change a member's role
+    lorewire prune [--older-than 30m]          remove sessions not seen since the cutoff
+    lorewire reset sessions [--user NAME|--me] [--yes]   delete sessions (all, or one user's)
+    lorewire reset messages|all [--yes]        delete all messages / wipe everything
+
+  📁 SESSION — act as you (uses the current folder's identity/room/role):
+    lorewire whoami [--json]                    who am I here + this terminal's session detail
+    lorewire register [--new]                   put this terminal on the wire and join the room
+    lorewire join --room ROOM [--role ROLE]     join/create a room with a role
+    lorewire leave [--room ROOM] [--purge]      leave one room
+    lorewire leave --all [--purge]              remove this terminal's session from every room
+    lorewire send [--room ROOM] --to NAME|@ROLE|all|SESSION MSG   send a message
+    lorewire recv  [--room ROOM] [--json]       read + consume unread messages
+    lorewire inbox [--room ROOM] [--all] [--json]   show messages without consuming
+    lorewire watch [--room ROOM] [--interval 2s]    stream new messages
+    lorewire request [--room ROOM] --to @ROLE|NAME MSG   ask a role-holder for something (e.g. a key)
+    lorewire grant ID --secret VALUE            answer a request with a consume-once secret
+    lorewire deny  ID REASON                     decline a request
+
+TYPICAL AGENT FLOW
+    lorewire whoami                         # confirm who I am and my room
+    lorewire recv                           # read new messages (who asked what)
+    lorewire send --to alice "on it"        # reply to a specific user
+    lorewire send --to @dev "PR is up"      # message everyone with a role
+    lorewire request --to @cto "OpenAI API key"   # ask; the cto runs: grant <id> --secret …
+    lorewire sessions                       # see who else is online (global)
+
+RESOLUTION
+  Identity: --user/--name  >  $LOREWIRE_USER_ID / $LOREWIRE_NAME  >  .lorewire.jsonc userId
+  Room:     --room  >  $LOREWIRE_ROOM  >  .lorewire.jsonc room  >  "main"
+  Role:     --role  >  $LOREWIRE_ROLE  >  .lorewire.jsonc role  >  "guest"
+  Session:  $LOREWIRE_SESSION (full id)  >  a token from $LOREWIRE_SESSION_TOKEN /
+            $LOREWIRE_SESSION_ENV (name an agent's session-id var) / a known agent
+            session id  >  the controlling tty. One agent session = one lorewire session.
+  Database (shared by all sessions): $LOREWIRE_DB, else ~/.lorewire/lorewire.db
+  Add --json to any listing/read command for machine-readable output.
 `)
 }
 
@@ -225,6 +276,65 @@ func resolveIdentity(st *Store, fUser, fName, fRoom, fRole string, ensure bool) 
 	return id, nil
 }
 
+// captureContext gathers this terminal/session/agent's detail into a Session.
+// full=true also runs the subprocess probes (tty, git) used by register/watch;
+// false skips them for lightweight commands, and RegisterSession preserves any
+// value a fuller earlier capture stored.
+func captureContext(full bool) Session {
+	s := Session{
+		PID:         os.Getppid(),
+		Client:      clientKind(),
+		OSUser:      osUser(),
+		OS:          goOS(),
+		Arch:        goArch(),
+		Shell:       filepath.Base(os.Getenv("SHELL")),
+		TermProgram: os.Getenv("TERM_PROGRAM"),
+		Version:     lorewireVersion(),
+		SSH:         os.Getenv("SSH_CONNECTION") != "" || os.Getenv("SSH_TTY") != "",
+		Tmux:        os.Getenv("TMUX") != "",
+	}
+	s.CWD, _ = os.Getwd()
+	s.Host, _ = os.Hostname()
+	// Record where the session id was derived from (for debugging). An explicit
+	// full id ($LOREWIRE_SESSION) short-circuits the token entirely.
+	if os.Getenv(envSession) != "" {
+		s.IDSource = "env:" + envSession
+	} else {
+		_, s.IDSource = terminalTokenSourced()
+	}
+	if full {
+		s.TTY = ttyName()
+		s.GitBranch = gitOut("rev-parse", "--abbrev-ref", "HEAD")
+		if top := gitOut("rev-parse", "--show-toplevel"); top != "" {
+			s.GitRepo = filepath.Base(top)
+		}
+	}
+	return s
+}
+
+// currentUserID resolves "me" for --me filters: the userId of the identity in
+// the current folder's config / env, WITHOUT creating anything. Errors clearly
+// when there is no identity here, or the resolved username has never registered.
+func currentUserID(st *Store) (string, string, error) {
+	id, err := resolveIdentity(st, "", "", "", "", false)
+	if err != nil {
+		return "", "", err
+	}
+	if id.userID != "" {
+		return id.userID, id.username, nil
+	}
+	// Quick mode (username via $LOREWIRE_NAME) doesn't resolve a userId until
+	// the user exists — look it up; a not-yet-created user has no sessions/rooms.
+	uid, ok, err := st.UserByName(id.username)
+	if err != nil {
+		return "", "", err
+	}
+	if !ok {
+		return "", "", fmt.Errorf("no registered user %q yet — run `lorewire register` first", id.username)
+	}
+	return uid, id.username, nil
+}
+
 // ctx resolves identity and ensures this terminal's session row exists (upsert
 // with best-effort context).
 //
@@ -241,14 +351,9 @@ func ctx(st *Store, fUser, fName, fRoom, fRole string, fullContext, joinRoom boo
 	if err != nil {
 		return ident{}, err
 	}
-	sess := Session{ID: id.sessionID, OwnerID: id.userID}
-	if fullContext {
-		sess.CWD, _ = os.Getwd()
-		sess.TTY = ttyName()
-		sess.PID = os.Getppid()
-		sess.Host, _ = os.Hostname()
-		sess.Client = clientKind()
-	}
+	sess := captureContext(fullContext)
+	sess.ID = id.sessionID
+	sess.OwnerID = id.userID
 	if err := st.RegisterSession(sess); err != nil {
 		return ident{}, err
 	}
@@ -304,7 +409,7 @@ func cmdUserCreate(args []string) error {
 	}
 	fmt.Printf("user %q → %s\n", name, userID)
 	if !*noWrite {
-		path, err := writeConfig("", userID, *room, *role)
+		path, err := writeConfig("", userID, name, *room, *role)
 		if err != nil {
 			return err
 		}
@@ -382,16 +487,69 @@ func cmdInit(args []string) error {
 	if userID == "" {
 		return fmt.Errorf("provide --username NAME or --user usr_… of an existing identity")
 	}
-	if _, ok, err := st.UserByID(userID); err != nil {
-		return err
-	} else if !ok {
-		return fmt.Errorf("no user with id %q", userID)
-	}
-	path, err := writeConfig("", userID, *room, *role)
+	uname, ok, err := st.UserByID(userID)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s (userId %s)\n", path, userID)
+	if !ok {
+		return fmt.Errorf("no user with id %q", userID)
+	}
+	path, err := writeConfig("", userID, uname, *room, *role)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s (userId %s, username %s)\n", path, userID, uname)
+	return nil
+}
+
+// cmdImport re-creates the identity described by the local .lorewire.jsonc in
+// this machine's database — the fresh-machine / post-wipe path. It reads the
+// userId (and username hint) from the config and, if that userId isn't already
+// present, registers it. Idempotent: a no-op when the identity already exists.
+func cmdImport(args []string) error {
+	fs := flag.NewFlagSet("import", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.Path == "" {
+		return fmt.Errorf("no .lorewire.jsonc found here (or in a parent dir) to import")
+	}
+	if cfg.UserID == "" {
+		return fmt.Errorf("%s has no userId to import", cfg.Path)
+	}
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// Already present → nothing to do (report the current username).
+	if name, ok, err := st.UserByID(cfg.UserID); err != nil {
+		return err
+	} else if ok {
+		fmt.Printf("already imported: %s is %q (from %s)\n", cfg.UserID, name, cfg.Path)
+		return nil
+	}
+
+	// Not present → need a username to create it. Prefer the optional positional
+	// arg, else the config's username hint.
+	name := cfg.Username
+	if fs.NArg() > 0 {
+		name = fs.Arg(0)
+	}
+	if name == "" {
+		return fmt.Errorf("%s has no username to import under — run `lorewire import <name>`", cfg.Path)
+	}
+	if _, err := st.CreateUser(name, cfg.UserID); err != nil {
+		return err
+	}
+	// Refresh the config so a missing username hint gets written for next time.
+	writeConfig(filepath.Dir(cfg.Path), cfg.UserID, name, cfg.Room, cfg.Role)
+	fmt.Printf("imported %q (%s) from %s — ready to use here\n", name, cfg.UserID, cfg.Path)
 	return nil
 }
 
@@ -408,14 +566,38 @@ func cmdWhoami(args []string) error {
 	if err != nil {
 		return err
 	}
+	cfg, _ := loadConfig()
+
+	// The current terminal's stored session row + its room memberships (nil /
+	// empty until this terminal has registered).
+	sess, registered, err := st.SessionByID(id.sessionID)
+	if err != nil {
+		return err
+	}
+	memberships, err := st.MembershipsForSession(id.sessionID)
+	if err != nil {
+		return err
+	}
+
 	if *asJSON {
+		// Everything about "me" in one object: resolved identity + where each
+		// value came from + this terminal's full session row + memberships.
 		return printJSON(map[string]any{
-			"userId": id.userID, "username": id.username, "session": id.sessionID,
-			"room": id.room, "role": id.role,
-			"sources": map[string]string{"identity": id.srcUser, "room": id.srcRoom, "role": id.srcRole},
+			"userId":     id.userID,
+			"username":   id.username,
+			"session":    id.sessionID,
+			"registered": registered,
+			"room":       id.room,
+			"role":       id.role,
+			"config":     cfg.Path,
+			"sources": map[string]string{
+				"identity": id.srcUser, "room": id.srcRoom, "role": id.srcRole,
+			},
+			"sessionDetail": sess, // null until registered
+			"memberships":   memberships,
 		})
 	}
-	cfg, _ := loadConfig()
+
 	fmt.Printf("username : %s (%s)\n", id.username, id.srcUser)
 	if id.userID != "" {
 		fmt.Printf("userId   : %s\n", id.userID)
@@ -430,7 +612,68 @@ func cmdWhoami(args []string) error {
 	} else {
 		fmt.Printf("config   : (none found)\n")
 	}
+
+	fmt.Println("\nsession (this terminal):")
+	if !registered {
+		fmt.Println("  (not registered yet — run `lorewire register`)")
+		return nil
+	}
+	fmt.Printf("  cwd      : %s\n", orDash(sess.CWD))
+	if sess.GitRepo != "" || sess.GitBranch != "" {
+		fmt.Printf("  git      : %s @ %s\n", orDash(sess.GitRepo), orDash(sess.GitBranch))
+	}
+	fmt.Printf("  client   : %s\n", orDash(sess.Client))
+	fmt.Printf("  terminal : %s\n", orDash(sess.TermProgram))
+	fmt.Printf("  tty      : %s\n", orDash(sess.TTY))
+	fmt.Printf("  id from  : %s\n", orDash(sess.IDSource))
+	fmt.Printf("  os user  : %s\n", orDash(sess.OSUser))
+	fmt.Printf("  platform : %s/%s  (%s)\n", orDash(sess.OS), orDash(sess.Arch), orDash(sess.Shell))
+	fmt.Printf("  host     : %s\n", orDash(sess.Host))
+	fmt.Printf("  pid      : %s\n", orDashInt(sess.PID))
+	if flags := sessionFlags(sess); flags != "" {
+		fmt.Printf("  flags    : %s\n", flags)
+	}
+	fmt.Printf("  version  : %s\n", orDash(sess.Version))
+	fmt.Printf("  started  : %s\n", sess.CreatedAt.Local().Format("15:04:05"))
+	fmt.Printf("  last seen: %s\n", humanAgo(sess.LastSeen))
+	if len(memberships) == 0 {
+		fmt.Printf("  member of: (no rooms)\n")
+	} else {
+		parts := make([]string, len(memberships))
+		for i, m := range memberships {
+			parts[i] = fmt.Sprintf("%s (%s)", m.Room, m.Role)
+		}
+		fmt.Printf("  member of: %s\n", strings.Join(parts, ", "))
+	}
 	return nil
+}
+
+// orDash renders "?" for an empty string so a missing session field is obvious.
+func orDash(s string) string {
+	if s == "" {
+		return "?"
+	}
+	return s
+}
+
+func orDashInt(n int) string {
+	if n == 0 {
+		return "?"
+	}
+	return strconv.Itoa(n)
+}
+
+// sessionFlags renders the boolean environment markers (ssh, tmux) as a short
+// comma list, or "" when none apply.
+func sessionFlags(s *Session) string {
+	var f []string
+	if s.SSH {
+		f = append(f, "ssh")
+	}
+	if s.Tmux {
+		f = append(f, "tmux")
+	}
+	return strings.Join(f, ", ")
 }
 
 // ── Presence & rooms ────────────────────────────────────────────────────────
@@ -567,8 +810,125 @@ func cmdPrune(args []string) error {
 	return nil
 }
 
+// resetScope names what `reset` deletes. Closed set → constants (commandment #1).
+const (
+	resetSessions = "sessions"
+	resetMessages = "messages"
+	resetAll      = "all"
+)
+
+func cmdReset(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: lorewire reset sessions|messages|all [--yes]")
+	}
+	scope := args[0]
+	fs := flag.NewFlagSet("reset", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "actually delete (without this, only a preview is shown)")
+	user := fs.String("user", "", "for `reset sessions`: only this username's sessions")
+	me := fs.Bool("me", false, "for `reset sessions`: only my sessions (current folder's identity)")
+	fs.Parse(args[1:])
+
+	st, err := openStore()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	users, sessions, rooms, messages, err := st.Counts()
+	if err != nil {
+		return err
+	}
+
+	// Resolve an optional session target (--user / --me), which scopes
+	// `reset sessions` to one user instead of everyone.
+	targetID, targetName := "", ""
+	if *me {
+		id, name, err := currentUserID(st)
+		if err != nil {
+			return err
+		}
+		targetID, targetName = id, name
+	} else if *user != "" {
+		id, ok, err := st.UserByName(*user)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("no user named %q", *user)
+		}
+		targetID, targetName = id, *user
+	}
+	if targetID != "" && scope != resetSessions {
+		return fmt.Errorf("--user/--me only apply to `reset sessions`")
+	}
+
+	// Describe the blast radius for this scope, so the preview and the action
+	// agree on exactly what will be removed.
+	var summary string
+	switch scope {
+	case resetSessions:
+		if targetID != "" {
+			mine, err := st.Sessions(targetID)
+			if err != nil {
+				return err
+			}
+			summary = fmt.Sprintf("%d session(s) belonging to %q (everything else kept)", len(mine), targetName)
+		} else {
+			summary = fmt.Sprintf("%d session(s) and their room memberships (users, rooms, messages kept)", sessions)
+		}
+	case resetMessages:
+		summary = fmt.Sprintf("%d message(s) (users, rooms, sessions kept)", messages)
+	case resetAll:
+		summary = fmt.Sprintf("EVERYTHING — %d user(s), %d room(s), %d session(s), %d message(s)",
+			users, rooms, sessions, messages)
+	default:
+		return fmt.Errorf("unknown reset scope %q (use sessions|messages|all)", scope)
+	}
+
+	// Confirmation gate: destructive, so require --yes; otherwise just preview.
+	if !*yes {
+		fmt.Printf("would delete: %s\n", summary)
+		hint := "lorewire reset " + scope
+		if targetName != "" {
+			hint += " --user " + targetName
+		}
+		fmt.Printf("re-run with --yes to proceed: %s --yes\n", hint)
+		return nil
+	}
+
+	switch scope {
+	case resetSessions:
+		if targetID != "" {
+			n, err := st.DeleteSessionsForOwner(targetID)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("deleted %d session(s) of %q\n", n, targetName)
+			return nil
+		}
+		n, err := st.DeleteAllSessions()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("deleted %d session(s)\n", n)
+	case resetMessages:
+		n, err := st.DeleteAllMessages()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("deleted %d message(s)\n", n)
+	case resetAll:
+		if err := st.ResetAll(); err != nil {
+			return err
+		}
+		fmt.Printf("reset complete — database wiped (%s)\n", summary)
+	}
+	return nil
+}
+
 func cmdRooms(args []string) error {
 	fs := flag.NewFlagSet("rooms", flag.ExitOnError)
+	me := fs.Bool("me", false, "only rooms I'm a member of (the current folder's identity)")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
 	st, err := openStore()
@@ -576,7 +936,15 @@ func cmdRooms(args []string) error {
 		return err
 	}
 	defer st.Close()
-	rooms, err := st.Rooms()
+	owner := ""
+	if *me {
+		uid, _, err := currentUserID(st)
+		if err != nil {
+			return err
+		}
+		owner = uid
+	}
+	rooms, err := st.Rooms(owner)
 	if err != nil {
 		return err
 	}
@@ -679,6 +1047,7 @@ func targetSessions(st *Store, room, target string) ([]string, error) {
 
 func cmdSessions(args []string) error {
 	fs := flag.NewFlagSet("sessions", flag.ExitOnError)
+	me := fs.Bool("me", false, "only MY sessions (the current folder's identity)")
 	asJSON := fs.Bool("json", false, "output JSON")
 	fs.Parse(args)
 	st, err := openStore()
@@ -686,7 +1055,15 @@ func cmdSessions(args []string) error {
 		return err
 	}
 	defer st.Close()
-	sess, err := st.Sessions()
+	owner := ""
+	if *me {
+		uid, _, err := currentUserID(st)
+		if err != nil {
+			return err
+		}
+		owner = uid
+	}
+	sess, err := st.Sessions(owner)
 	if err != nil {
 		return err
 	}
@@ -704,15 +1081,11 @@ func cmdSessions(args []string) error {
 			fmt.Printf("%s (%s)\n", s.Username, s.OwnerID)
 			lastUser = s.Username
 		}
-		loc := s.CWD
-		if loc == "" {
-			loc = "?"
+		loc := orDash(s.CWD)
+		if s.GitBranch != "" {
+			loc += " @" + s.GitBranch // show the branch inline — high-value for agents
 		}
-		ttyStr := s.TTY
-		if ttyStr == "" {
-			ttyStr = "?"
-		}
-		fmt.Printf("  %-18s  %s  %s  %s  seen %s\n", s.ID, loc, ttyStr, s.Client, humanAgo(s.LastSeen))
+		fmt.Printf("  %-18s  %s  %s  seen %s\n", s.ID, loc, orDash(s.Client), humanAgo(s.LastSeen))
 	}
 	return nil
 }

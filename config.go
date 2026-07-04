@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 )
@@ -39,19 +42,95 @@ func newUserID() string { return userIDPrefix + nanoID(userIDNanoID) }
 
 // terminalToken returns a value that is stable for the life of one terminal and
 // distinct across terminals, so every lorewire invocation in the same terminal
-// maps to the same session. It is derived from the tty device behind stdin
-// (unique per pts, incl. tmux panes). Falls back to the parent shell pid when
-// stdin is not a tty (piped/scripted), and to $LOREWIRE_SESSION_TOKEN when set.
+// maps to the same session.
+//
+// It is derived from the CONTROLLING TERMINAL (/dev/tty), NOT stdin. This is the
+// crucial detail for agent use: when Claude Code (or any tool) runs `lorewire`
+// as a subprocess — a Bash tool-call or a hook — that subprocess's stdin is
+// usually redirected (a pipe or /dev/null), so keying off stdin's device, or
+// off the parent pid, produces a DIFFERENT id on every call and the terminal
+// accumulates a new session each time. The controlling terminal is inherited by
+// every process in the session regardless of stdin redirection, so /dev/tty
+// yields one stable id for the whole session. Falls back to stdin's tty (plain
+// interactive shell) and finally the parent pid; $LOREWIRE_SESSION_TOKEN
+// overrides everything.
 func terminalToken() string {
+	t, _ := terminalTokenSourced()
+	return t
+}
+
+// terminalTokenSourced is terminalToken plus a short label of WHERE the token
+// came from (for the sessions.id_source column and `whoami`, so it's obvious
+// and debuggable why a terminal maps to a given session).
+func terminalTokenSourced() (token, source string) {
+	// 1) Explicit override — any integration can set this directly.
 	if s := os.Getenv(envSessionToken); s != "" {
-		return s
+		return s, "env:" + envSessionToken
+	}
+	// 2) Inside an agent, prefer its stable per-session id: a tty is unreliable
+	// there (piped stdin, /dev/tty often "device not configured"), so keying on
+	// the agent's session id is what keeps every tool-call and hook of one agent
+	// session mapped to a single lorewire session. Tool-agnostic: check any env
+	// var names the user configured via LOREWIRE_SESSION_ENV first, then the
+	// built-in known-list.
+	if id, src := agentSessionSourced(); id != "" {
+		return "agent-" + id, src
+	}
+	// 3) Plain terminal: the controlling tty device (stable per window/pane).
+	if dev, ok := ttyRdev("/dev/tty"); ok {
+		return fmt.Sprintf("tty-%d", dev), "tty:/dev/tty"
 	}
 	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			return fmt.Sprintf("tty-%d", st.Rdev)
+			return fmt.Sprintf("tty-%d", st.Rdev), "tty:stdin"
 		}
 	}
-	return fmt.Sprintf("ppid-%d", os.Getppid())
+	return fmt.Sprintf("ppid-%d", os.Getppid()), "ppid"
+}
+
+// agentSessionID returns a stable per-session id from the environment, or "" if
+// none is present. It checks, in order: the user-configured var names in
+// $LOREWIRE_SESSION_ENV (comma-separated), then the built-in known-list
+// (agentSessionEnvs). This is the tool-agnostic seam — new agent runtimes are
+// supported by naming their session-id env var, no code change required.
+// agentSessionSourced returns the agent session id and the name of the env var
+// it came from ("agent:<VAR>"), or ("","") if none is present.
+func agentSessionSourced() (id, source string) {
+	if names := os.Getenv(envSessionEnv); names != "" {
+		for _, k := range strings.Split(names, ",") {
+			k = strings.TrimSpace(k)
+			if v := os.Getenv(k); v != "" {
+				return v, "agent:" + k
+			}
+		}
+	}
+	for _, k := range agentSessionEnvs {
+		if v := os.Getenv(k); v != "" {
+			return v, "agent:" + k
+		}
+	}
+	return "", ""
+}
+
+// ttyRdev opens a terminal device and returns its rdev (the underlying pts
+// device number, stable across all processes sharing that controlling
+// terminal). ok=false when there is no controlling terminal (e.g. a daemon or
+// a fully detached process).
+func ttyRdev(path string) (uint64, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Rdev), true
 }
 
 // sessionID builds this terminal's session handle: username + "~" + a short
@@ -88,6 +167,39 @@ func clientKind() string {
 	return clientShell
 }
 
+// ── System/terminal probes (assembled into a Session by captureContext) ──────
+
+// osUser returns the OS login name (for the sessions.os_user column).
+func osUser() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return os.Getenv("USER")
+}
+
+// lorewireVersion reports the built version from the module build info (a real
+// version for `go install pkg@vX`, "(devel)" for a local build).
+func lorewireVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		return info.Main.Version
+	}
+	return ""
+}
+
+// gitOut runs a git command in the current directory and returns its trimmed
+// stdout, or "" on any error (not a repo, git missing, …).
+func gitOut(args ...string) string {
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// goOS / goArch expose the compile-time platform for the session columns.
+func goOS() string   { return runtime.GOOS }
+func goArch() string { return runtime.GOARCH }
+
 // ── Config file (.lorewire.jsonc) ───────────────────────────────────────────
 
 const configFileName = ".lorewire.jsonc"
@@ -96,9 +208,14 @@ const configFileName = ".lorewire.jsonc"
 // reporting); empty Path means no config file was located.
 type FileConfig struct {
 	UserID string `json:"userId"`
-	Room   string `json:"room"`
-	Role   string `json:"role"`
-	Path   string `json:"-"`
+	// Username is a portability hint: it lets `lorewire import` re-create this
+	// identity on a fresh machine/empty DB (where the username can't be derived
+	// from the userId). The DB remains the source of truth; after a `user
+	// rename` this value may be stale, but the userId still resolves correctly.
+	Username string `json:"username"`
+	Room     string `json:"room"`
+	Role     string `json:"role"`
+	Path     string `json:"-"`
 }
 
 // findConfig walks up from the current directory to the filesystem root,
@@ -142,7 +259,7 @@ func loadConfig() (*FileConfig, error) {
 
 // writeConfig writes a .lorewire.jsonc into dir (default: cwd) with a helpful
 // comment header. Overwrites any existing file's managed keys.
-func writeConfig(dir, userID, room, role string) (string, error) {
+func writeConfig(dir, userID, username, room, role string) (string, error) {
 	if dir == "" {
 		d, err := os.Getwd()
 		if err != nil {
@@ -158,14 +275,16 @@ func writeConfig(dir, userID, room, role string) (string, error) {
 	}
 	path := filepath.Join(dir, configFileName)
 	content := fmt.Sprintf(`{
-  // lorewire project config. Env vars ($LOREWIRE_USER_ID / _ROOM / _ROLE) and
-  // command flags override these values. userId is your stable identity —
-  // claim it with `+"`lorewire user create <name>`"+`.
+  // lorewire project config. Env vars ($LOREWIRE_USER_ID / _NAME / _ROOM / _ROLE)
+  // and command flags override these values. userId is your stable identity —
+  // claim it with `+"`lorewire user create <name>`"+`. On a fresh machine run
+  // `+"`lorewire import`"+` to re-create this identity from the fields below.
   "userId": %q,
+  "username": %q,
   "room": %q,
   "role": %q
 }
-`, userID, room, role)
+`, userID, username, room, role)
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}
