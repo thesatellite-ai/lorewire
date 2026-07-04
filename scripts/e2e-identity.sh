@@ -50,6 +50,19 @@ sec=$( export LOREWIRE_SESSION_TOKEN=c1; "$LW" recv --room project-x | grep -Eo 
 again=$( export LOREWIRE_SESSION_TOKEN=c1; "$LW" recv --room project-x )
 [ "$again" = "(no new messages)" ] && pass "consume-once (secret gone)" || fail "consume-once"
 
+echo "== a recv-only session auto-joins and receives (regression) =="
+# A terminal that only ever runs recv must still become a room member and get
+# --to <user> messages — the "nothing works when I watch" bug.
+( export LOREWIRE_SESSION_TOKEN=cwatch; "$LW" recv --room project-x >/dev/null )
+inroom=$( "$LW" members --room project-x | grep -c 'caroline\|carol' )
+( export LOREWIRE_NAME=dave LOREWIRE_SESSION_TOKEN=d1; "$LW" send --room project-x --to carol "to the watcher" >/dev/null )
+wgot=$( export LOREWIRE_SESSION_TOKEN=cwatch; "$LW" recv --room project-x | grep -c 'to the watcher' )
+[ "$wgot" = "1" ] && pass "recv-only session joined and received" || fail "recv-only receive ($wgot)"
+
+echo "== incidental send/recv does NOT downgrade an explicit role (regression) =="
+drole=$( "$LW" members --room project-x | awk '/dave~/{print $2; exit}' )
+[ "$drole" = "qa" ] && pass "dave still qa after his own sends" || fail "role clobbered: dave=$drole"
+
 echo "== rename cascades to sessions =="
 "$LW" user rename carol caroline >/dev/null
 mem=$( "$LW" members --room project-x | grep -c 'caroline~' )

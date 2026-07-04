@@ -226,8 +226,17 @@ func resolveIdentity(st *Store, fUser, fName, fRoom, fRole string, ensure bool) 
 }
 
 // ctx resolves identity and ensures this terminal's session row exists (upsert
-// with best-effort context). Used by every command that acts as a session.
-func ctx(st *Store, fUser, fName, fRoom, fRole string, fullContext bool) (ident, error) {
+// with best-effort context).
+//
+// joinRoom controls whether the session is also made a MEMBER of the resolved
+// room. This matters because delivery is room-scoped: `--to <user>`/`@role`/
+// `all` only reach sessions that are members of that room. A command that
+// receives (recv/watch/inbox) or participates (send/request) must therefore
+// join, or a terminal that only ever runs `watch` would silently receive
+// nothing (it registered a session but was never in the room). register/join
+// pass joinRoom=false because they call Store.Join explicitly to report
+// created/owner.
+func ctx(st *Store, fUser, fName, fRoom, fRole string, fullContext, joinRoom bool) (ident, error) {
 	id, err := resolveIdentity(st, fUser, fName, fRoom, fRole, true)
 	if err != nil {
 		return ident{}, err
@@ -242,6 +251,13 @@ func ctx(st *Store, fUser, fName, fRoom, fRole string, fullContext bool) (ident,
 	}
 	if err := st.RegisterSession(sess); err != nil {
 		return ident{}, err
+	}
+	if joinRoom {
+		// EnsureMember, NOT Join: incidental presence must not overwrite a role
+		// set by an explicit `join --role`/`role set`.
+		if err := st.EnsureMember(id.room, id.sessionID, id.userID, id.role); err != nil {
+			return ident{}, err
+		}
 	}
 	return id, nil
 }
@@ -436,7 +452,7 @@ func cmdRegister(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true)
+	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true, false)
 	if err != nil {
 		return err
 	}
@@ -466,7 +482,7 @@ func cmdJoin(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true)
+	id, err := ctx(st, *fUser, *fName, *fRoom, *fRole, true, false)
 	if err != nil {
 		return err
 	}
@@ -726,7 +742,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, *room, "", false)
+	id, err := ctx(st, *fUser, *fName, *room, "", false, true)
 	if err != nil {
 		return err
 	}
@@ -761,7 +777,7 @@ func cmdRequest(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, *room, "", false)
+	id, err := ctx(st, *fUser, *fName, *room, "", false, true)
 	if err != nil {
 		return err
 	}
@@ -800,7 +816,7 @@ func cmdGrant(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, "", "", false)
+	id, err := ctx(st, *fUser, *fName, "", "", false, false)
 	if err != nil {
 		return err
 	}
@@ -830,7 +846,7 @@ func cmdDeny(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, "", "", false)
+	id, err := ctx(st, *fUser, *fName, "", "", false, false)
 	if err != nil {
 		return err
 	}
@@ -865,7 +881,7 @@ func cmdRecv(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, "", "", false)
+	id, err := ctx(st, *fUser, *fName, "", "", false, true)
 	if err != nil {
 		return err
 	}
@@ -893,7 +909,7 @@ func cmdInbox(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, "", "", false)
+	id, err := ctx(st, *fUser, *fName, "", "", false, true)
 	if err != nil {
 		return err
 	}
@@ -921,7 +937,7 @@ func cmdWatch(args []string) error {
 		return err
 	}
 	defer st.Close()
-	id, err := ctx(st, *fUser, *fName, "", "", true)
+	id, err := ctx(st, *fUser, *fName, "", "", true, true)
 	if err != nil {
 		return err
 	}

@@ -35,6 +35,9 @@ out="$("$LW" recv 2>/dev/null || true)"
 [ -z "$out" ] && exit 0
 [ "$out" = "(no new messages)" ] && exit 0
 
-echo "📨 Messages from other sessions (delivered by lorewire, addressed to '$LOREWIRE_NAME'):"
+# Identity may come from .lorewire.jsonc rather than $LOREWIRE_NAME, so derive
+# the display name from whoami instead of assuming the env var is set.
+who="$("$LW" whoami 2>/dev/null | awk '/^username/{print $3; exit}')"
+echo "📨 Messages for ${who:-this session} from other lorewire sessions:"
 echo "$out"
-echo "(Reply with: lorewire send --to <name> \"...\")"
+echo "(Reply with: lorewire send --to <name|@role> \"...\")"

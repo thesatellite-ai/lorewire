@@ -519,6 +519,39 @@ ON CONFLICT(room, session_id) DO UPDATE SET role = excluded.role`,
 	return created, owner, err
 }
 
+// EnsureMember makes a session a member of a room WITHOUT changing its role if
+// it is already a member. Used by incidental commands (send/recv/watch/inbox)
+// so that merely messaging or listening never downgrades a role that an
+// explicit `join`/`role set` established. Creates the room (owned by this user)
+// if it doesn't exist yet. Contrast Store.Join, which upserts the role because
+// register/join are deliberate "set my role here" actions.
+func (s *Store) EnsureMember(room, sessionID, ownerID, role string) error {
+	if role == "" {
+		role = roleGuest
+	}
+	now := time.Now().UTC().Format(timeFmt)
+	return withRetry(func() error {
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO rooms (name, owner_id, created_at) VALUES (?, ?, ?)`,
+			room, ownerID, now); err != nil {
+			return err
+		}
+		// INSERT OR IGNORE: if the session is already a member, this is a no-op
+		// and the existing role is preserved.
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO members (room, session_id, owner_id, role, joined_at) VALUES (?, ?, ?, ?, ?)`,
+			room, sessionID, ownerID, role, now); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
+}
+
 // LeaveRoom removes one session from one room. purge also deletes that session's
 // inbox in that room.
 func (s *Store) LeaveRoom(room, sessionID string, purge bool) (existed bool, purged int64, err error) {

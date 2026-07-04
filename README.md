@@ -391,6 +391,7 @@ task reset          # delete the default database
 
 ## Documentation
 
+- **[Tutorial](docs/TUTORIAL.md)** — hands-on: two Claude Code sessions talking to each other, from zero to secrets, step by step.
 - **[Complete reference manual](docs/REFERENCE.md)** — every command, flag, environment variable, config key, addressing form, hook, schema table, exit code, and recipe.
 - [PLAN.md](PLAN.md) — design decisions and rationale for the identity/config layer.
 - `hooks/settings.example.json` — ready-to-merge Claude Code hook config.
