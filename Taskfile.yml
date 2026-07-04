@@ -34,12 +34,25 @@ tasks:
     cmds:
       - ./scripts/e2e-identity.sh
 
-  test:
-    desc: Run all end-to-end scenarios
+  test-unit:
+    desc: Run Go unit tests with the race detector
     cmds:
+      - go test -race ./...
+
+  test:
+    desc: Run unit tests + all end-to-end scenarios
+    cmds:
+      - task: test-unit
       - task: test-e2e
       - task: test-rooms
       - task: test-identity
+
+  check:
+    desc: Pre-PR gate — format, vet, and unit tests
+    cmds:
+      - gofmt -l .
+      - go vet ./...
+      - go test -race ./...
 
   demo:
     desc: Register alice/bob/carol in the default DB and show sessions

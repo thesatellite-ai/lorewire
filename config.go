@@ -32,8 +32,8 @@ func nanoID(n int) string {
 	return string(buf)
 }
 
-// newUserID mints a fresh, stable identity id: `usr_` + 7-char nanoid.
-func newUserID() string { return "usr_" + nanoID(7) }
+// newUserID mints a fresh, stable identity id: the userId prefix + a nanoid.
+func newUserID() string { return userIDPrefix + nanoID(userIDNanoID) }
 
 // ── Terminal / session handle ───────────────────────────────────────────────
 
@@ -43,7 +43,7 @@ func newUserID() string { return "usr_" + nanoID(7) }
 // (unique per pts, incl. tmux panes). Falls back to the parent shell pid when
 // stdin is not a tty (piped/scripted), and to $LOREWIRE_SESSION_TOKEN when set.
 func terminalToken() string {
-	if s := os.Getenv("LOREWIRE_SESSION_TOKEN"); s != "" {
+	if s := os.Getenv(envSessionToken); s != "" {
 		return s
 	}
 	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
@@ -58,7 +58,7 @@ func terminalToken() string {
 // stable hash of the terminal token → e.g. "bob~a1f2".
 func sessionID(username string) string {
 	sum := sha256.Sum256([]byte(terminalToken()))
-	return username + "~" + hex.EncodeToString(sum[:])[:4]
+	return username + sessionSep + hex.EncodeToString(sum[:])[:sessionHashLen]
 }
 
 // ttyName best-effort resolves a human-readable terminal name for display
@@ -76,13 +76,16 @@ func ttyName() string {
 // display. Honors $LOREWIRE_CLIENT (hooks can set it), else guesses Claude Code
 // from its env marker, else "shell".
 func clientKind() string {
-	if c := os.Getenv("LOREWIRE_CLIENT"); c != "" {
+	if c := os.Getenv(envClient); c != "" {
 		return c
 	}
+	// CLAUDECODE / CLAUDE_CODE are Claude Code's own env markers (an external
+	// contract), kept verbatim per the wire-format exception to the no-bare-
+	// strings rule; the value we STORE is our own typed constant.
 	if os.Getenv("CLAUDECODE") != "" || os.Getenv("CLAUDE_CODE") != "" {
-		return "claude-code"
+		return clientClaudeCode
 	}
-	return "shell"
+	return clientShell
 }
 
 // ── Config file (.lorewire.jsonc) ───────────────────────────────────────────

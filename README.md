@@ -358,8 +358,10 @@ lorewire sessions      # alice is gone; only bob remains
 ## Development
 
 ```bash
-task build          # build ./lorewire
-task test           # run all e2e scenarios
+task build          # build ./lorewire (stripped)
+task check          # pre-PR gate: gofmt + go vet + go test -race
+task test           # unit tests + all e2e scenarios
+task test-unit      # Go unit tests with the race detector
 task test-e2e       # flat-mode scenario (direct, broadcast, concurrency)
 task test-rooms     # rooms/roles/@role/request-grant scenario
 task test-identity  # users, sessions, .lorewire.jsonc, precedence, rename

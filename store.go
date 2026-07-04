@@ -119,7 +119,7 @@ func withRetry(fn func() error) error {
 // ── Open / migrate ──────────────────────────────────────────────────────────
 
 func dbPath() (string, error) {
-	if p := os.Getenv("LOREWIRE_DB"); p != "" {
+	if p := os.Getenv(envDB); p != "" {
 		return p, nil
 	}
 	home, err := os.UserHomeDir()
@@ -276,8 +276,8 @@ func (s *Store) Close() error { return s.db.Close() }
 // non-empty userID re-imports an existing identity (e.g. on a new machine).
 // Fails if the username is already taken by a different userId.
 func (s *Store) CreateUser(username, userID string) (string, error) {
-	if username == "" || strings.ContainsAny(username, "~ ") {
-		return "", fmt.Errorf("invalid username %q (no spaces or '~', non-empty)", username)
+	if username == "" || strings.ContainsAny(username, sessionSep+" ") {
+		return "", fmt.Errorf("invalid username %q (no spaces or %q, non-empty)", username, sessionSep)
 	}
 	if userID == "" {
 		userID = newUserID()
@@ -350,8 +350,8 @@ func (s *Store) UserByID(userID string) (string, bool, error) {
 // changes, so committed .lorewire.jsonc files are unaffected. Rare operation;
 // the extra UPDATEs are bounded to one user's rows.
 func (s *Store) RenameUser(oldName, newName string) error {
-	if strings.ContainsAny(newName, "~") || newName == "" {
-		return fmt.Errorf("invalid username %q (no '~', non-empty)", newName)
+	if strings.ContainsAny(newName, sessionSep) || newName == "" {
+		return fmt.Errorf("invalid username %q (no %q, non-empty)", newName, sessionSep)
 	}
 	return withRetry(func() error {
 		tx, err := s.db.Begin()
@@ -383,8 +383,8 @@ func (s *Store) RenameUser(oldName, newName string) error {
 			return err
 		}
 		// Messages reference session ids by string; the "old~" prefix is unique
-		// (usernames can't contain "~"), so LIKE 'old~%' is safe.
-		like := oldName + "~%"
+		// (usernames can't contain sessionSep), so LIKE 'old~%' is safe.
+		like := oldName + sessionSep + "%"
 		if _, err := tx.Exec(
 			`UPDATE messages SET from_id = ? || substr(from_id, ?) WHERE from_id LIKE ?`,
 			newName, tail, like); err != nil {
@@ -691,14 +691,14 @@ WHERE m.room = ? ORDER BY u.username, m.session_id`, room)
 // The sender's own session is always excluded from fan-out.
 func (s *Store) resolveRecipients(room, fromSession, to string) ([]string, error) {
 	switch {
-	case strings.HasPrefix(to, "@"):
+	case strings.HasPrefix(to, addrRolePrefix):
 		return s.queryNames(
 			`SELECT session_id FROM members WHERE room = ? AND role = ? AND session_id != ? ORDER BY session_id`,
-			room, strings.TrimPrefix(to, "@"), fromSession)
-	case to == "all" || to == "*":
+			room, strings.TrimPrefix(to, addrRolePrefix), fromSession)
+	case to == addrAll || to == addrAllStar:
 		return s.queryNames(
 			`SELECT session_id FROM members WHERE room = ? AND session_id != ? ORDER BY session_id`, room, fromSession)
-	case strings.Contains(to, "~"):
+	case strings.Contains(to, sessionSep):
 		return []string{to}, nil
 	default:
 		// username → that user's sessions that are members of this room

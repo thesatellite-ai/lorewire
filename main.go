@@ -134,7 +134,7 @@ func pick(pairs ...srcVal) (string, string) {
 			return p.val, p.src
 		}
 	}
-	return "", "default"
+	return "", srcDefault
 }
 
 // resolveIdentity computes the effective identity WITHOUT writing to the DB.
@@ -182,23 +182,23 @@ func resolveIdentity(st *Store, fUser, fName, fRoom, fRole string, ensure bool) 
 	}
 	switch {
 	case fUser != "":
-		if err := byID(fUser, "flag"); err != nil {
+		if err := byID(fUser, srcFlag); err != nil {
 			return ident{}, err
 		}
 	case fName != "":
-		if err := byName(fName, "flag"); err != nil {
+		if err := byName(fName, srcFlag); err != nil {
 			return ident{}, err
 		}
-	case os.Getenv("LOREWIRE_USER_ID") != "":
-		if err := byID(os.Getenv("LOREWIRE_USER_ID"), "env"); err != nil {
+	case os.Getenv(envUserID) != "":
+		if err := byID(os.Getenv(envUserID), srcEnv); err != nil {
 			return ident{}, err
 		}
-	case os.Getenv("LOREWIRE_NAME") != "":
-		if err := byName(os.Getenv("LOREWIRE_NAME"), "env"); err != nil {
+	case os.Getenv(envName) != "":
+		if err := byName(os.Getenv(envName), srcEnv); err != nil {
 			return ident{}, err
 		}
 	case cfg.UserID != "":
-		if err := byID(cfg.UserID, "config"); err != nil {
+		if err := byID(cfg.UserID, srcConfig); err != nil {
 			return ident{}, err
 		}
 	default:
@@ -207,20 +207,20 @@ func resolveIdentity(st *Store, fUser, fName, fRoom, fRole string, ensure bool) 
 	}
 
 	id.sessionID, _ = pick(
-		srcVal{os.Getenv("LOREWIRE_SESSION"), "env"},
-		srcVal{sessionID(id.username), "auto"},
+		srcVal{os.Getenv(envSession), srcEnv},
+		srcVal{sessionID(id.username), srcAuto},
 	)
 	id.room, id.srcRoom = pick(
-		srcVal{fRoom, "flag"},
-		srcVal{os.Getenv("LOREWIRE_ROOM"), "env"},
-		srcVal{cfg.Room, "config"},
-		srcVal{defaultRoom, "default"},
+		srcVal{fRoom, srcFlag},
+		srcVal{os.Getenv(envRoom), srcEnv},
+		srcVal{cfg.Room, srcConfig},
+		srcVal{defaultRoom, srcDefault},
 	)
 	id.role, id.srcRole = pick(
-		srcVal{fRole, "flag"},
-		srcVal{os.Getenv("LOREWIRE_ROLE"), "env"},
-		srcVal{cfg.Role, "config"},
-		srcVal{roleGuest, "default"},
+		srcVal{fRole, srcFlag},
+		srcVal{os.Getenv(envRole), srcEnv},
+		srcVal{cfg.Role, srcConfig},
+		srcVal{roleGuest, srcDefault},
 	)
 	return id, nil
 }
@@ -429,7 +429,7 @@ func cmdRegister(args []string) error {
 	fs.Parse(args)
 	if *newSess {
 		// Rotate the session token so this terminal gets a distinct handle.
-		os.Setenv("LOREWIRE_SESSION_TOKEN", terminalToken()+"-"+nanoID(4))
+		os.Setenv(envSessionToken, terminalToken()+"-"+nanoID(rotateTokenLen))
 	}
 	st, err := openStore()
 	if err != nil {
@@ -954,7 +954,7 @@ func resolveRoomFlag(flagVal string) string {
 	if flagVal != "" {
 		return flagVal
 	}
-	if env := os.Getenv("LOREWIRE_ROOM"); env != "" {
+	if env := os.Getenv(envRoom); env != "" {
 		return env
 	}
 	if cfg, err := loadConfig(); err == nil && cfg.Room != "" {
