@@ -5,14 +5,14 @@ vars:
 
 tasks:
   build:
-    desc: Build the lorewire binary into the repo root
+    desc: Build the lorewire binary into the repo root (stripped for size)
     cmds:
-      - go build -o {{.BIN}} .
+      - go build -ldflags="-s -w" -o {{.BIN}} .
 
   install:
     desc: Build and install lorewire into $GOBIN (or ~/go/bin) so every session can call it
     cmds:
-      - go install .
+      - go install -ldflags="-s -w" .
 
   tidy:
     desc: Sync go.mod / go.sum

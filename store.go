@@ -130,7 +130,13 @@ func dbPath() (string, error) {
 }
 
 func dsnFor(path string) string {
-	return fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)", path)
+	// busy_timeout: wait for the write lock under cross-process contention.
+	// journal_mode=WAL: readers proceed during a writer.
+	// synchronous=NORMAL: safe under WAL (no corruption on crash — at most the
+	// last committed transaction is lost on power failure) and markedly faster
+	// for the many small writes a message bus does.
+	return fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)", path)
 }
 
 func openStore() (*Store, error) {
